@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.32
- Tag: 32
+ Version: 9.33
+ Tag: 33
     
     Version History:
     1.0 - Initial version
@@ -97,6 +97,7 @@
     9.30 - FIX: Get-CachedWhitelistJSON returned its log line concatenated with the cached body, so $whitelistJSON was "Using cached whitelist (age 0.6 min...) {actual JSON}" and ConvertFrom-Json failed with "Invalid JSON primitive". Root cause: Write-Log emits to the success stream under some conditions (Out-File internally); every other value-returning function in the script already pipes Write-Log to Out-Null for this reason - I missed it on the new function. All Write-Log calls inside Get-CachedWhitelistJSON now end with `| Out-Null`. Also added a defensive validator: cached and fetched bodies are checked to start with `{` or `[` before being used; corrupt cache files are auto-deleted so the next run re-fetches.
     9.31 - PERF: Dialogs now appear ~2-3 s faster. Three cold-start reductions in every scheduled-task-launched dialog (informational progress, mandatory update, deferral, completion notification, user prompt): (a) Added -NoProfile to the spawned powershell.exe so user profile customizations (e.g. Oh My Posh) no longer load before the WPF window renders - saved ~1-2 s on profiles with prompt frameworks. (b) Collapsed four separate Add-Type -AssemblyName calls into one combined call - PresentationFramework, PresentationCore, WindowsBase loaded together is noticeably faster than four sequential calls. (c) Dropped System.Windows.Forms from four of the five dialog scripts that only used it for [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; replaced with WPF's [System.Windows.SystemParameters]::WorkArea which is part of the already-loaded WindowsBase assembly - saves a whole extra assembly load (~500 ms). Net effect: the upgrade progress dialog now renders before winget finishes downloading instead of after, fixing the "dialogs appear after the work is done" symptom.
     9.32 - FEATURE (foundation): Persistent dialog host - replaces the per-app dialog spawn pattern with a single long-lived WPF window that swaps content as remediation progresses. This commit adds only the foundation (command protocol, host script, lifecycle helpers); the existing Show-* / Invoke-System* functions are unchanged and still spawn per-dialog scheduled tasks. Next commit wires them through Send-DialogCommand with the legacy spawn kept as fallback. Protocol: JSON-lines appended to C:\ProgramData\Temp\availableUpgrades-dialog-<sessionId>.cmd, host pumps every 250 ms and replies via per-id files in the .replies dir; heartbeat + PID file make liveness verifiable in <10 s. Window has 5 panels (Progress, Transition, Completion, Mandatory, Deferral, Skip) toggled via Visibility; only one renders at a time. Cross-context handshake reuses the Schedule-UserContextRemediation pattern - SYSTEM starts the host and passes -DialogSessionId to user-context, which connects to the same files. Lifecycle is SYSTEM-owned: Stop-DialogHost is called after user-context handoff completes (or after SYSTEM's own loop if no handoff). User dismissal via X-button sets a session-scoped suppression flag; subsequent fire-and-forget commands (show-progress/status/transition/complete) are silently swallowed but blocking prompt-* commands (mandatory/deferral/skip) always force the window back into view because they require an explicit answer. Day-scoped SuppressInfoDialogs flag becomes obsolete in the new path (still honored by legacy fallback). Stale-task sweep and temp-file cleanup regex updated for the new DialogHost_ / availableUpgrades-dialog- patterns.
+    9.33 - FEATURE (wire-up): Routes every dialog through the persistent dialog host introduced in v9.32; legacy per-app scheduled-task spawn is retained as fallback when the host is unavailable. New script parameter -DialogSessionId lets user-context attach to the SYSTEM-owned session via Connect-DialogSession; Schedule-UserContextRemediation appends -DialogSessionId to the user-context launch args only when Test-DialogHostAlive. Start-DialogHost runs once at the top of the main remediation block in SYSTEM context; Stop-DialogHost runs on both exit paths gated on (-not $UserRemediationOnly) so user-context never tears down a host SYSTEM started. Wrappers added at the public entry points: Show-CompletionNotification -> complete; Show-UpgradeProgressNotification -> show-progress (returns $null on host path so legacy signal-file callers no-op); Write-InfoDialogStatus -> status (routes to host whenever alive, independent of SignalFilePath); Show-MandatoryUpdateDialog -> prompt-mandatory ("upgrade"/"timeout" both mean proceed, returns "Continue"); Show-DeferralDialog -> prompt-mandatory for ForceUpdate, prompt-deferral otherwise; Show-VersionSkipDialog -> prompt-skip. Main loop emits a `transition` command between successive apps using $Script:DialogPrevApp; after the foreach loop ends, a final `complete` reports total apps processed + overall success/failure, triggering the host's 3 s auto-hide. Show-ProcessCloseDialog and the general-purpose Yes/No prompts (Show-UserDialog, Invoke-SystemUserPrompt, Show-ModernDialog, Show-DirectUserDialog) are intentionally left on the legacy path - their UX doesn't match any of the six host panels yet.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -106,7 +107,8 @@
 param(
     [switch]$UserRemediationOnly,
     [string]$RemediationResultFile,
-    [string]$WhitelistUrl
+    [string]$WhitelistUrl,
+    [string]$DialogSessionId
 )
 
 # Note: Admin requirement is conditional - not needed for user context execution (UserRemediationOnly mode)
@@ -2455,6 +2457,11 @@ function Show-UpgradeProgressNotification {
         Launches a WPF progress dialog as a scheduled task in user context.
         The dialog polls for a signal file and updates when the upgrade completes.
         Returns the signal file path immediately without blocking.
+
+        v9.33: if the persistent dialog host is alive, sends a `show-progress`
+        command instead of spawning a legacy progress dialog, and returns $null
+        (so the legacy file-signal callers skip their writes and Write-InfoDialogStatus
+        routes through the host instead).
     .PARAMETER AppName
         Application ID
     .PARAMETER FriendlyName
@@ -2464,7 +2471,7 @@ function Show-UpgradeProgressNotification {
     .PARAMETER AvailableVersion
         Available version for update
     .OUTPUTS
-        String - path to signal file, or $null on failure
+        String - path to signal file (legacy), or $null on failure / host path
     #>
     param(
         [string]$AppName,
@@ -2478,6 +2485,16 @@ function Show-UpgradeProgressNotification {
         $versionText = ""
         if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
             $versionText = "$CurrentVersion &#x2192; $AvailableVersion"
+        }
+
+        # v9.33: persistent dialog host path
+        if (Test-DialogHostAlive) {
+            Send-DialogCommand -Cmd "show-progress" -Payload @{
+                app = $displayName
+                fromVersion = $CurrentVersion
+                toVersion = $AvailableVersion
+            } | Out-Null
+            return $null
         }
 
         Write-Log "Showing informational progress dialog for $displayName" | Out-Null
@@ -2779,6 +2796,11 @@ function Write-InfoDialogStatus {
         [string]$SignalFilePath,
         [string]$Status
     )
+    # v9.33: route through persistent dialog host when alive, regardless of SignalFilePath
+    if (Test-DialogHostAlive) {
+        Send-DialogCommand -Cmd "status" -Payload @{ text = $Status } | Out-Null
+        return
+    }
     if (-not $SignalFilePath) { return }
     try {
         $statusFile = $SignalFilePath -replace '\.json$', '_Status.txt'
@@ -2960,15 +2982,30 @@ function Show-CompletionNotification {
     .SYNOPSIS
         Shows a completion notification that auto-closes after 5 seconds
     .DESCRIPTION
-        Displays an informational notification when an upgrade completes successfully
+        Displays an informational notification when an upgrade completes successfully.
+        v9.33: if the persistent dialog host is alive, sends a `complete` command to it
+        instead of spawning a per-app scheduled task; falls back to legacy spawn otherwise.
     #>
     param(
         [string]$AppName,
-        [string]$FriendlyName
+        [string]$FriendlyName,
+        [bool]$Success = $true
     )
 
     try {
         $displayName = if (-not [string]::IsNullOrEmpty($FriendlyName)) { $FriendlyName } else { $AppName }
+
+        # v9.33: persistent dialog host path
+        if (Test-DialogHostAlive) {
+            $sent = Send-DialogCommand -Cmd "complete" -Payload @{
+                app = $displayName
+                success = $Success
+                title = if ($Success) { "Update complete" } else { "Update could not be completed" }
+                body = $displayName
+            }
+            if ($sent) { return }
+            # fall through to legacy on host send failure
+        }
 
         if (Test-RunningAsSystem) {
             # System context - use scheduled task approach
@@ -3354,7 +3391,12 @@ function Show-MandatoryUpdateDialog {
     .SYNOPSIS
         Shows a mandatory update dialog with only a Continue button
     .DESCRIPTION
-        Used when updates are required and cannot be deferred - no Cancel option
+        Used when updates are required and cannot be deferred - no Cancel option.
+        v9.33: when the persistent dialog host is alive, sends a `prompt-mandatory`
+        command. Both "upgrade" and "timeout" responses mean proceed (legacy treats
+        mandatory timeouts the same way), so we return "Continue" without a progress
+        signal path; the subsequent Show-UpgradeProgressNotification call will swap
+        the host to its ProgressPanel.
     #>
     param(
         [string]$Question,
@@ -3364,6 +3406,21 @@ function Show-MandatoryUpdateDialog {
     )
 
     try {
+        # v9.33: persistent dialog host path
+        if (Test-DialogHostAlive) {
+            $parts = $Question -split '\|', 2
+            $versionInfo = if ($parts.Count -ge 1) { $parts[0] } else { "" }
+            $bodyText = if ($parts.Count -ge 2) { $parts[1] } else { $Question }
+            $reply = Send-DialogCommand -Cmd "prompt-mandatory" -Payload @{
+                title = $Title
+                versionInfo = $versionInfo
+                body = $bodyText
+                timeoutSec = $TimeoutSeconds
+            } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
+            # "upgrade" (clicked), "timeout" (waited it out), $null (host died) -> all mean proceed
+            return "Continue"
+        }
+
         if (Test-RunningAsSystem) {
             # System context - use scheduled task approach
             return Invoke-SystemMandatoryUpdatePrompt -Question $Question -Title $Title -TimeoutSeconds $TimeoutSeconds
@@ -4403,12 +4460,50 @@ function Show-DeferralDialog {
     
     try {
         Write-Log "Show-DeferralDialog called for $AppName" | Out-Null
-        
+
         # Use provided FriendlyName or fallback to AppName
         $displayName = if (-not [string]::IsNullOrEmpty($FriendlyName)) { $FriendlyName } else { $AppName }
-        
+
         # Determine if process needs to be closed
         $hasBlockingProcess = -not [string]::IsNullOrEmpty($ProcessName)
+
+        # v9.33: persistent dialog host path
+        if (Test-DialogHostAlive) {
+            $versionText = if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
+                "$displayName $CurrentVersion -> $AvailableVersion"
+            } else {
+                "$displayName update available"
+            }
+            if ($DeferralStatus.ForceUpdate) {
+                # Forced update - route as prompt-mandatory; both "upgrade" and "timeout" mean proceed
+                Send-DialogCommand -Cmd "prompt-mandatory" -Payload @{
+                    title = "Required Update: $displayName"
+                    versionInfo = $versionText
+                    body = if ($hasBlockingProcess) { "$displayName must be closed to install this update." } else { [string]$DeferralStatus.Message }
+                    timeoutSec = $TimeoutSeconds
+                } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30) | Out-Null
+                return @{
+                    Action = "Update"
+                    DeferralDays = 0
+                    CloseProcess = $hasBlockingProcess
+                }
+            }
+            # Deferrable - route as prompt-deferral
+            $daysLeft = if ($DeferralStatus.PSObject.Properties['DaysRemaining']) { [int]$DeferralStatus.DaysRemaining } elseif ($DeferralStatus.PSObject.Properties['MaxDeferralDays']) { [int]$DeferralStatus.MaxDeferralDays } else { $null }
+            $reply = Send-DialogCommand -Cmd "prompt-deferral" -Payload @{
+                title = "Update Available: $displayName"
+                body = $versionText + "`n`n" + [string]$DeferralStatus.Message
+                daysLeft = $daysLeft
+                canDefer = ($DeferralStatus.CanDefer -eq $true)
+                timeoutSec = $TimeoutSeconds
+            } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
+            $choice = if ($reply -and $reply.response) { [string]$reply.response } else { "timeout" }
+            if ($choice -eq "defer") {
+                return @{ Action = "Defer"; DeferralDays = 1; CloseProcess = $false }
+            }
+            # "update" or "timeout" (default to update, matches legacy fallback) or host died
+            return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $hasBlockingProcess }
+        }
         
         # Build dialog content
         $versionText = ""
@@ -5439,6 +5534,8 @@ function Show-VersionSkipDialog {
     .SYNOPSIS
         Shows a dialog offering the user to skip a version after repeated failures.
         Returns $true if user chose to skip, $false to retry next time.
+        v9.33: when the persistent dialog host is alive, sends a `prompt-skip` command.
+        "skip" -> $true; "retry"/"timeout"/host-died -> $false.
     #>
     param(
         [Parameter(Mandatory)][string]$AppName,
@@ -5450,6 +5547,18 @@ function Show-VersionSkipDialog {
 
     try {
         $displayName = if ($FriendlyName) { $FriendlyName } else { $AppName }
+
+        # v9.33: persistent dialog host path
+        if (Test-DialogHostAlive) {
+            $reply = Send-DialogCommand -Cmd "prompt-skip" -Payload @{
+                app = $displayName
+                failures = $FailureCount
+                body = "Version $Version has failed $FailureCount times. Skip this version, or retry next cycle?"
+                timeoutSec = $TimeoutSeconds
+            } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
+            $choice = if ($reply -and $reply.response) { [string]$reply.response } else { "timeout" }
+            return ($choice -eq "skip")
+        }
 
         $userInfo = Get-InteractiveUser
         if (-not $userInfo) {
@@ -5745,12 +5854,14 @@ function Schedule-UserContextRemediation {
         # Create hidden launch action using VBS wrapper (no console window flash)
         # Pass WhitelistUrl through so the user-context child process uses the same whitelist source
         $whitelistArg = if ($whitelistUrl) { " -WhitelistUrl `"$whitelistUrl`"" } else { "" }
-        $remPsArgs = "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`"$whitelistArg"
+        # v9.33: pass the live dialog session id so user-context can attach to the same WPF host
+        $dialogArg = if ($Script:DialogSession -and (Test-DialogHostAlive)) { " -DialogSessionId `"$($Script:DialogSession.SessionId)`"" } else { "" }
+        $remPsArgs = "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`"$whitelistArg$dialogArg"
         $remLaunch = New-HiddenLaunchAction -PowerShellArguments $remPsArgs -VbsDirectory $sharedTempPath
         if (-not $remLaunch) {
             Write-Log "ERROR: Failed to create hidden launch action - falling back to direct PowerShell" | Out-Null
             $remLaunch = @{
-                Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`"$whitelistArg"
+                Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`"$whitelistArg$dialogArg"
                 VbsPath = $null
             }
         }
@@ -7417,6 +7528,15 @@ if ($UserRemediationOnly) {
         Write-Log -Message "Process ID: $PID"
         Write-Log -Message "Running user remediation task"
         Write-Log -Message "RemediationResultFile parameter: $RemediationResultFile"
+
+        # Attach to the persistent dialog host SYSTEM started (v9.33).
+        # If no session id was passed or the host has died, dialog wrappers fall back to legacy spawn.
+        if ($DialogSessionId) {
+            Write-Log -Message "DialogSessionId passed by SYSTEM: $DialogSessionId - connecting"
+            Connect-DialogSession -SessionId $DialogSessionId | Out-Null
+        } else {
+            Write-Log -Message "No DialogSessionId from SYSTEM - dialog wrappers will use legacy spawn"
+        }
         
         # Create heartbeat and status files for system context synchronization
         $resultFileDir = if ($RemediationResultFile) { Split-Path $RemediationResultFile -Parent } else { "C:\ProgramData\Temp" }
@@ -7763,13 +7883,34 @@ if ($LIST -and $LIST.Count -gt 0) {
             Write-Log -Message "Winget source pre-update failed (non-fatal): $($_.Exception.Message)"
         }
 
+        # Start the persistent dialog host (v9.33). Only SYSTEM context owns the host;
+        # user-context attaches via Connect-DialogSession when it gets -DialogSessionId.
+        # Failure here populates $Script:DialogLegacyFallback so all dialog wrappers
+        # transparently fall back to the legacy per-dialog spawn path.
+        if ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
+            Write-Log -Message "Starting persistent dialog host (v9.33)"
+            Start-DialogHost | Out-Null
+        }
+
         Write-Log -Message "Starting app processing loop..."
+
+        $Script:DialogPrevApp = $null   # last app for which we emitted a panel; drives `transition` between apps
 
         foreach ($appInfo in $LIST) {
             if ($appInfo.AppID -ne "") {
                 # Keep heartbeat alive during app processing so SYSTEM parent doesn't time out
                 if (Get-Command Update-Heartbeat -ErrorAction SilentlyContinue) {
                     Update-Heartbeat -Stage "AppProcessing" -AdditionalData @{ AppID = $appInfo.AppID }
+                }
+                # v9.33: emit a transition from the previous app to the current one so the
+                # persistent dialog gives a visible hand-off instead of jumping straight to the
+                # next ProgressPanel. No-op when host is not alive.
+                if ($Script:DialogPrevApp -and (Test-DialogHostAlive)) {
+                    Send-DialogCommand -Cmd "transition" -Payload @{
+                        fromApp = $Script:DialogPrevApp
+                        toApp = $appInfo.AppID
+                        outcome = "ok"
+                    } | Out-Null
                 }
                 $doUpgrade = $false
                 foreach ($okapp in $whitelistConfig) {
@@ -8340,7 +8481,22 @@ if ($LIST -and $LIST.Count -gt 0) {
                         }
                     }
                 }
+                # v9.33: remember this app so the next iteration can emit a `transition` from it
+                $Script:DialogPrevApp = $appInfo.AppID
             }
+        }
+
+        # v9.33: signal end of upgrade run to the persistent dialog host so it shows the final
+        # completion panel and auto-hides after 3 s. No-op when host is not alive (legacy spawn
+        # already wrote completion signals per-app).
+        if (Test-DialogHostAlive) {
+            $hadFailure = ($message -match '\(FAILED\)' -or $message -match '\(ERROR\)')
+            $body = if ($count -eq 1) { "1 app processed" } else { "$count apps processed" }
+            Send-DialogCommand -Cmd "complete" -Payload @{
+                success = (-not $hadFailure)
+                title = if ($hadFailure) { "Some updates failed" } else { "Updates complete" }
+                body = $body
+            } | Out-Null
         }
 
         # If we're in SYSTEM context, hand off to user context only when the task file
@@ -8448,6 +8604,13 @@ if ($LIST -and $LIST.Count -gt 0) {
             Write-Log -Message "*** USER CONTEXT TASK EXITING after $($totalUserContextTime.TotalSeconds) seconds ***"
         }
         
+        # Stop the persistent dialog host (v9.33). SYSTEM owns lifecycle; user-context
+        # is a no-op because Stop-DialogHost short-circuits on $Script:DialogSession=null,
+        # and even if user-context attached, only SYSTEM writes the TaskName/PID.
+        if ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
+            Stop-DialogHost | Out-Null
+        }
+
         Write-Log -Message "Performing final marker file cleanup before script completion"
         Invoke-MarkerFileCleanup -Reason "Script completion (remediation complete)"
         exit 0
@@ -8496,6 +8659,11 @@ if ($LIST -and $LIST.Count -gt 0) {
         } catch {
             Write-Log -Message "ERROR writing empty result file: $($_.Exception.Message)"
         }
+    }
+
+    # Stop the persistent dialog host on the no-upgrades path too (v9.33).
+    if ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
+        Stop-DialogHost | Out-Null
     }
 
     Write-Log -Message "Performing final marker file cleanup before script exit (no upgrades)"
