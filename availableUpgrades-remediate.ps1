@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.43
- Tag: 43
+ Version: 9.44
+ Tag: 44
     
     Version History:
     1.0 - Initial version
@@ -105,6 +105,7 @@
     9.38 - FIX: When the per-app loop ended without processing any apps (e.g. the only app in the task file was actively deferred and got skipped), the script still sent a `complete` command to the dialog host. The host briefly rendered "Updates complete - 0 apps processed" with its 3-second auto-hide, but Stop-DialogHost fired immediately after and force-killed the host process within ~1 s, producing a visible sub-second flash of the completion panel even though the run was a no-op. Now the final `complete` command is gated on $count -gt 0 so a no-op run leaves the host hidden through teardown.
     9.39 - FIX: WingetUpgradeManager registry state (Deferrals, Failures, ReleaseCache) was being read/written via PSDrive paths like HKLM:\SOFTWARE\WingetUpgradeManager\..., which the Windows WoW64 redirector silently rewrites to HKLM:\SOFTWARE\WOW6432Node\... when the host process is 32-bit. Intune Remediations default to a 32-bit PowerShell host, so all script writes went to WOW6432Node; anything reading from a 64-bit context (manual PowerShell prompt, ad-hoc tooling) saw an empty/stale view. A user with an active Notepad++ deferral was invisible to a 64-bit Get-ChildItem on the non-WOW path while clearly visible at the WOW6432Node path. Fix: introduced $Script:WumRegRoot pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager and routed all 12 call sites through it (later renamed to $Script:AppRegRoot in v9.40). Both 32-bit and 64-bit PowerShell hosts now hit the same physical hive. Chose WOW6432Node-pinned (not 64-bit-pinned via .NET OpenBaseKey) because existing data is already at WOW6432Node from prior 32-bit Intune runs, so no migration is required; the trade-off is that orphaned entries written to the native HKLM:\SOFTWARE\WingetUpgradeManager by old 64-bit runs become invisible to the script (acceptable: those entries were already stale or expired).
     9.40 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot to match. No automatic migration of state from the old WingetUpgradeManager path - existing deferrals, failures, and release cache entries become orphaned. On the next run the script sees an empty state, so users will be re-prompted for any apps with pending updates instead of having their previously-set deferrals honored. Manual cleanup of the orphaned old key is up to the operator: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager' -Recurse -Force.
+    9.44 - UX: Dialog status during winget upgrade is more informative. Initial status is now "Preparing download..." instead of "Downloading update..." so the user can see when bytes actually start moving. Invoke-WingetWithProgress now (a) accepts B/KB/MB/GB on both sides of the X / Y size regex (was KB|MB / MB|GB only, which silently failed on small/very-large downloads), (b) falls back to a "Downloading XX%" status when only a percentage is parseable (newer winget builds render a unicode progress bar with no inline size), and (c) latches into an "Installing update..." status the first time it sees Successfully installed / Successfully verified installer hash / Starting package install / Starting installer / "^Installing" / Configuring - so the dialog stops saying "Downloading" once the bytes are down. Install-phase detection also covers more winget output variants (1.5 used "Starting package install", 1.7+ uses "Starting installer").
     9.43 - FIX: On a freshly-set-up Windows machine the dialog host failed to start - parent logged "Dialog host did not heartbeat within 8 s" and fell back to legacy spawn, AND no preserved host log was produced. The host process actually started but died before its first Write-DH call. Root cause: when C:\ProgramData\Temp was freshly created by SYSTEM (Start-DialogHost's auto-create branch), it inherited C:\ProgramData's default ACL which grants Users only Read+Execute - not Create-File. v9.41's ACL fix granted the user Modify on the FILES that SYSTEM had pre-created (CmdFile/CursorFile/HeartbeatFile), but the host's very first action is to WriteAllText its OWN files (PidFile, LogFile, replies/*.json), and the user couldn't CREATE new files in the parent directory. The host's WriteAllText on PidFile threw Access Denied, the process died, no Write-DH ever fired, and the parent waited 8 s on a heartbeat that would never come. Two fixes: (a) Session files now live inside a per-session SUBDIRECTORY (C:\ProgramData\Temp\availableUpgrades-dialog-<id>\{cmd, cursor, heartbeat, pid, host.log, replies\}); SYSTEM creates that directory and grants the user Modify with ContainerInherit+ObjectInherit, so every file the host wants to create inside it just works. (b) Heartbeat wait window bumped from 8 s to 15 s to cover slow first-run WPF cold start. Stop-DialogHost moves the log out to a flat sibling location before removing the per-session directory, so log preservation still works.
     9.42 - FIX: v9.39's "pin registry path to WOW6432Node" approach was based on the wrong WoW64 semantics. PSDrive registry cmdlets (Get-ItemProperty, Set-ItemProperty, etc.) go through the WoW64 redirector, which from a 32-bit PowerShell host rewrites HKLM:\SOFTWARE\X to HKLM:\SOFTWARE\WOW6432Node\X *unconditionally* - it does not notice that WOW6432Node is already in the requested path. So v9.39's writes to HKLM:\SOFTWARE\WOW6432Node\AppUpdater\Deferrals\... actually landed at HKLM:\SOFTWARE\WOW6432Node\WOW6432Node\AppUpdater\Deferrals\... (confirmed in field: Notepad++.Notepad++ deferral with the v9.41 ACL fix was discovered at the double-WOW path). Proper fix: introduced Open-AppRegKey / Test-AppRegKey / Get-AppRegValue / Get-AppRegProperties / Set-AppRegValue / Remove-AppRegValue / Remove-AppRegKey / Get-AppRegChildKeyNames helpers that use [Microsoft.Win32.RegistryKey]::OpenBaseKey(LocalMachine, Registry64), explicitly requesting the 64-bit view and bypassing the redirector entirely. All 12 PSDrive call sites in remediate.ps1 (Initialize-DeferralRegistry, Get-AppReleaseDate, Get-DeferralStatus, Set-WhitelistedAppDeferral, the deferral/cache cleanup, and the four Get/Set/Clear-VersionFailure functions) routed through the helpers. Data now lives at HKLM:\SOFTWARE\AppUpdater (visible from any 32-bit OR 64-bit observer at the natural path). Existing state at HKLM:\SOFTWARE\WOW6432Node\WOW6432Node\AppUpdater is orphaned with no automatic migration. Operator cleanup: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WOW6432Node\AppUpdater' -Recurse -Force.
     9.41 - FIX: Real root cause of "host died mid-prompt" and the "two dialogs on screen" symptom. SYSTEM creates the session IPC files (CmdFile, CursorFile, HeartbeatFile) in C:\ProgramData\Temp, where the default ACL gives CREATOR OWNER (i.e. SYSTEM) full control and Users only read. The user-context host process can therefore READ the cmd file but its WriteAllText on CursorFile and HeartbeatFile silently fails with "Access denied". The previous code swallowed those failures in a no-op catch, so the heartbeat file timestamp never refreshed - and ~10 s after host startup, the parent's Test-DialogHostAlive declared the host dead based on stale heartbeat while the host was alive and rendering a dialog. Send-DialogCommand then returned $null, the v9.36 wrapper fell through to the legacy spawn, and the user saw the legacy dialog appear on top of the still-up host dialog. Two fixes: (a) Start-DialogHost now explicitly grants the interactive user Modify rights on CmdFile/CursorFile/HeartbeatFile (via SetAccessRule) and on the ReplyDir (via inherited Modify) immediately after creating them, so the host can actually write its own heartbeat. (b) The pump's heartbeat-write catch now logs the first failure via Write-DH (suppresses repeats) instead of silently swallowing, so any future ACL/IO failure shows up immediately in the host log instead of producing a mysterious false-positive 10 s later. With these in place, the dialog host should remain provably alive throughout a 120 s prompt - no fallback spawn, one dialog on screen, then teardown when the user clicks Defer or Update Now.
@@ -3020,8 +3021,8 @@ function Invoke-WingetWithProgress {
         Write-Log "Started winget process (PID: $($proc.Id))" | Out-Null
 
         $lastStatus = ""
-        $downloadDetected = $false
         $pastSourceUpdate = $false
+        $installPhase    = $false   # latch: once Installing seen, never go back to Downloading
         while (-not $proc.HasExited) {
             Start-Sleep -Seconds 2
 
@@ -3055,29 +3056,47 @@ function Invoke-WingetWithProgress {
                             continue
                         }
 
-                        # Match winget stdout progress: "1024 KB / 6.31 MB" or "2.00 MB / 6.31 MB"
-                        $progressMatches = [regex]::Matches($outText, '([\d.]+)\s*(KB|MB)\s*/\s*([\d.]+)\s*(MB|GB)')
-                        if ($progressMatches.Count -gt 0) {
-                            $lastMatch = $progressMatches[$progressMatches.Count - 1]
-                            $dlVal = $lastMatch.Groups[1].Value
-                            $dlUnit = $lastMatch.Groups[2].Value
-                            $totalVal = $lastMatch.Groups[3].Value
-                            $totalUnit = $lastMatch.Groups[4].Value
-                            $downloadDetected = $true
-                            $status = "Downloading update... $dlVal $dlUnit / $totalVal $totalUnit"
+                        # v9.44: install-phase detection runs FIRST and latches. Once we've
+                        # seen a phrase that means winget has finished downloading and is
+                        # configuring/installing, never revert to "Downloading..." even if
+                        # an old size line is still sitting in the tail of $outText.
+                        if (-not $installPhase -and ($outText -match 'Successfully installed|Successfully verified installer hash|Starting package install|Starting installer|^\s*Installing\b|Configuring')) {
+                            $installPhase = $true
+                            $status = "Installing update..."
                             if ($status -ne $lastStatus) {
                                 $lastStatus = $status
                                 Write-InfoDialogStatus -SignalFilePath $SignalFilePath -Status $status
                             }
                         }
 
-                        # Detect installation phase (stdout shows this after download completes)
-                        if (-not $downloadDetected -or $lastStatus -like "Downloading*") {
-                            if ($outText -match 'Successfully installed|Installing|Configuring|Starting installer') {
-                                $status = "Installing update..."
+                        if (-not $installPhase) {
+                            # v9.44: broaden the size regex to accept any of B/KB/MB/GB on both
+                            # sides (was KB|MB / MB|GB), so total-in-KB and downloaded-in-GB
+                            # cases now produce a visible "X UNIT / Y UNIT" status instead of
+                            # leaving the dialog stuck on the initial "Preparing download...".
+                            $progressMatches = [regex]::Matches($outText, '([\d.]+)\s*(B|KB|MB|GB)\s*/\s*([\d.]+)\s*(B|KB|MB|GB)')
+                            if ($progressMatches.Count -gt 0) {
+                                $lastMatch = $progressMatches[$progressMatches.Count - 1]
+                                $dlVal    = $lastMatch.Groups[1].Value
+                                $dlUnit   = $lastMatch.Groups[2].Value
+                                $totalVal = $lastMatch.Groups[3].Value
+                                $totalUnit = $lastMatch.Groups[4].Value
+                                $status = "Downloading $dlVal $dlUnit / $totalVal $totalUnit"
                                 if ($status -ne $lastStatus) {
                                     $lastStatus = $status
                                     Write-InfoDialogStatus -SignalFilePath $SignalFilePath -Status $status
+                                }
+                            } else {
+                                # v9.44: percentage-only fallback for winget builds whose
+                                # progress line is just a unicode bar plus "XX%" (no sizes).
+                                $pctMatches = [regex]::Matches($outText, '(\d{1,3}(?:\.\d+)?)\s*%')
+                                if ($pctMatches.Count -gt 0) {
+                                    $lastPct = $pctMatches[$pctMatches.Count - 1].Groups[1].Value
+                                    $status = "Downloading $lastPct%"
+                                    if ($status -ne $lastStatus) {
+                                        $lastStatus = $status
+                                        Write-InfoDialogStatus -SignalFilePath $SignalFilePath -Status $status
+                                    }
                                 }
                             }
                         }
@@ -8379,14 +8398,17 @@ if ($LIST -and $LIST.Count -gt 0) {
                     try {
                         # TEST MODE: Simulate upgrade instead of running winget
                         if ($Script:TestMode -and $appInfo.AppID -eq "Test.DemoApp") {
-                            Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Downloading update..."
+                            Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Preparing download..."
                             Write-Log -Message "TEST MODE: Simulating upgrade for $($appInfo.AppID) (1.0.0 -> 2.0.0)"
                             Start-Sleep -Seconds 3
                             $upgradeOutput = "Successfully installed"
                             Write-Log -Message "TEST MODE: Simulated upgrade completed"
                         } else {
                         Write-Log -Message "Executing winget upgrade for: $($appInfo.AppID)"
-                        Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Downloading update..."
+                        # v9.44: start with "Preparing download..." so the user can see when winget
+                        # actually starts pulling bytes (status flips to "Downloading X MB / Y MB"
+                        # or "Downloading XX%") and later to "Installing update..." (latched).
+                        Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Preparing download..."
 
                         # First attempt: Standard upgrade with progress monitoring
                         $wingetExe = if ((Test-RunningAsSystem) -and $WingetPath) { Join-Path $WingetPath "winget.exe" } else { "winget.exe" }
