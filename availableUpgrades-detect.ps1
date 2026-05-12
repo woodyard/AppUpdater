@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.51
-    Tag: 81
+    Version: 5.52
+    Tag: 82
     
     Version History:
     1.0 - Initial version
@@ -97,6 +97,7 @@
     5.48 - TUNE: $LogDate dropped its _HH-mm component, so all detection runs on the same calendar day now append to a single DetectAvailableUpgrades-DD-MM-YY.log file instead of producing a new file per session. Mirrors remediate.ps1 v9.35. Remove-OldLogs's 1-month retention is unchanged.
     5.49 - FIX: WingetUpgradeManager deferral reads were going through PSDrive HKLM:\SOFTWARE\WingetUpgradeManager\..., which the WoW64 redirector rewrites to WOW6432Node for 32-bit PowerShell hosts. Combined with remediate.ps1 also being WoW64-redirected when run from Intune (32-bit default), data was effectively at WOW6432Node but invisible to 64-bit ad-hoc inspection. Switched the one deferral-read site here to $Script:WumRegRoot (pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager; later renamed to $Script:AppRegRoot in v5.50) so detect.ps1 and remediate.ps1 v9.39 always agree on where deferral state lives regardless of host bitness.
     5.50 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot. Mirrors remediate.ps1 v9.40. No automatic migration - existing state at the old path is orphaned.
+    5.52 - FIX: Get-AppInstalledScope's search-term list included the standalone publisher prefix from a dotted AppID (e.g. "Microsoft" for Microsoft.VisualStudioCode, "Google" for Google.Chrome). For prolific publishers this matched dozens of unrelated uninstall entries - 97 hits for "Microsoft" was typical on a machine with VS Code, Office, Azure tools, etc. - and the path-hint heuristic then picked an InstallLocation sample from a completely unrelated entry (e.g. "Microsoft Shared\VSTO\10.0" as the sample for Microsoft.VisualStudioCode), driving the routing decision off a cliff. Observed in field: Microsoft.VisualStudioCode (per-user UserSetup install in %LOCALAPPDATA%) and Microsoft.Bicep (no uninstall key at all) were both classified as "machine" because of these false matches, so SYSTEM-context remediation accepted them and then quietly failed to upgrade them. Anthropic.Claude correctly returned "unknown" but was kept in SYSTEM's list with no user-context fallback. Fix: dropped the standalone $idParts[0] term from the search list. Joined "Vendor Product" and product-only $idParts[-1] terms remain, which are what actually match real DisplayNames.
     5.51 - FIX: PSDrive registry access was being double-redirected by WoW64 (see remediate.ps1 v9.42 for the full diagnosis). Switched the one deferral-read site here to Open-AppRegKey / Get-AppRegValue / Test-AppRegKey helpers that go through [Microsoft.Win32.RegistryKey]::OpenBaseKey(LocalMachine, Registry64). Detect and remediate now both read/write at HKLM:\SOFTWARE\AppUpdater regardless of host bitness.
 
     Exit Codes:
@@ -848,14 +849,23 @@ function Get-AppInstalledScope {
     try {
         # Build a list of candidate DisplayName fragments. Order matters only for the log
         # line; the search is OR-across-terms.
+        # v5.52: dropped the standalone publisher-prefix term ($idParts[0], e.g. "Microsoft"
+        # or "Google"). The publisher alone matched every other product from the same vendor -
+        # 97+ hits for "Microsoft" on a typical machine - and the matches were against
+        # completely unrelated entries (e.g. Microsoft Shared\VSTO leftovers being picked as
+        # the InstallLocation sample for Microsoft.VisualStudioCode). DisplayNames in real
+        # uninstall keys are essentially always either the product name alone ("Bicep",
+        # "Chrome") or "Vendor Product" ("Google Chrome", "Microsoft Visual Studio Code") -
+        # both of which are already covered by the joined "Vendor Product" term and the
+        # product-only $idParts[-1] term. The bare-publisher term provided no real signal and
+        # poisoned the path-hint heuristic with sample paths from unrelated installs.
         $searchTerms = New-Object System.Collections.Generic.List[string]
         if ($FriendlyName) { [void]$searchTerms.Add($FriendlyName) }
         if ($AppID) {
             $idParts = $AppID -split '\.'
             if ($idParts.Count -gt 1) {
-                [void]$searchTerms.Add(($idParts -join ' '))   # "Google Chrome"
-                [void]$searchTerms.Add($idParts[-1])           # "Chrome"
-                [void]$searchTerms.Add($idParts[0])            # "Google" (catches publisher-prefixed DisplayNames)
+                [void]$searchTerms.Add(($idParts -join ' '))   # "Google Chrome" / "Microsoft VisualStudioCode"
+                [void]$searchTerms.Add($idParts[-1])           # "Chrome" / "VisualStudioCode"
             } else {
                 [void]$searchTerms.Add($AppID)
             }

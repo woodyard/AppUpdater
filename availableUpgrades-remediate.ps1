@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.48
- Tag: 48
+ Version: 9.49
+ Tag: 49
     
     Version History:
     1.0 - Initial version
@@ -105,6 +105,7 @@
     9.38 - FIX: When the per-app loop ended without processing any apps (e.g. the only app in the task file was actively deferred and got skipped), the script still sent a `complete` command to the dialog host. The host briefly rendered "Updates complete - 0 apps processed" with its 3-second auto-hide, but Stop-DialogHost fired immediately after and force-killed the host process within ~1 s, producing a visible sub-second flash of the completion panel even though the run was a no-op. Now the final `complete` command is gated on $count -gt 0 so a no-op run leaves the host hidden through teardown.
     9.39 - FIX: WingetUpgradeManager registry state (Deferrals, Failures, ReleaseCache) was being read/written via PSDrive paths like HKLM:\SOFTWARE\WingetUpgradeManager\..., which the Windows WoW64 redirector silently rewrites to HKLM:\SOFTWARE\WOW6432Node\... when the host process is 32-bit. Intune Remediations default to a 32-bit PowerShell host, so all script writes went to WOW6432Node; anything reading from a 64-bit context (manual PowerShell prompt, ad-hoc tooling) saw an empty/stale view. A user with an active Notepad++ deferral was invisible to a 64-bit Get-ChildItem on the non-WOW path while clearly visible at the WOW6432Node path. Fix: introduced $Script:WumRegRoot pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager and routed all 12 call sites through it (later renamed to $Script:AppRegRoot in v9.40). Both 32-bit and 64-bit PowerShell hosts now hit the same physical hive. Chose WOW6432Node-pinned (not 64-bit-pinned via .NET OpenBaseKey) because existing data is already at WOW6432Node from prior 32-bit Intune runs, so no migration is required; the trade-off is that orphaned entries written to the native HKLM:\SOFTWARE\WingetUpgradeManager by old 64-bit runs become invisible to the script (acceptable: those entries were already stale or expired).
     9.40 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot to match. No automatic migration of state from the old WingetUpgradeManager path - existing deferrals, failures, and release cache entries become orphaned. On the next run the script sees an empty state, so users will be re-prompted for any apps with pending updates instead of having their previously-set deferrals honored. Manual cleanup of the orphaned old key is up to the operator: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager' -Recurse -Force.
+    9.49 - FIX: Unknown-scope tasks never got a user-context retry when SYSTEM couldn't upgrade them. Observed in field: Bicep, VS Code (UserSetup), and Anthropic.Claude are all per-user installs - SYSTEM running `winget upgrade --id X` from its own profile sees nothing to upgrade and exits with no output, so the script logs "Processing completed" + outputLength=0 + empty LASTEXITCODE and the task stays on the list every cycle. detect.ps1 v5.52 fixes most of this by classifying VS Code and Claude correctly (user-scoped) so they're routed to user-context anyway, but apps with no uninstall key at all (Bicep) stay "unknown" - and the routing block's previous logic kept "unknown" tasks in SYSTEM's allowed-list without counting them in $Script:TasksForOtherContext, so the user-context handoff never fired for them. Routing now ALSO counts unknown-scope tasks SYSTEM is keeping as "needs other-context retry too" via a new $unknownAlsoOther list, so user-context is scheduled after SYSTEM's loop and gets a chance to upgrade per-user installs that SYSTEM couldn't see.
     9.48 - FIX: Two related defects. (a) Set-SystemSleepBlocked threw "Cannot convert argument esFlags" because PowerShell parses 0x80000000 / 0x80000001 as [Int64] (they exceed [Int32]::MaxValue) and Add-Type's `uint` parameter rejects an Int64. Cast both literals to [uint32] explicitly. (b) During multi-app remediation runs the dialog hid in the middle of a later app's progress, then came back, etc. Cause: per-app Show-CompletionNotification sends a `complete` command which starts the host's 3-second auto-hide timer; when the loop moved to the next app and sent `transition` / `show-progress`, the new commands brought the window back via Ensure-Visible but the prior hideTimer was still ticking - it fired later and hid the window mid-progress on the new app. Process-Command now cancels any pending $script:hideTimer the moment a new non-lifecycle command arrives (anything other than `hide` / `shutdown`), so only the FINAL complete - the one with no follow-up commands - actually gets to auto-hide.
     9.47 - FIX: Dialog jumped straight from "Preparing download..." to "Installing update..." without ever showing a "Downloading..." status for small/fast apps. v9.44's install-phase latch ran BEFORE the download-progress regex on each poll, so on the very first 2 s poll if winget had already finished downloading (Successfully verified installer hash already in $outText), $installPhase tripped immediately and the download-progress branch was skipped forever. Inverted the order: every poll now parses download progress FIRST and writes "Downloading X MB / Y MB" (or "Downloading XX%", or generic "Downloading update..." if neither is parseable yet), THEN checks for install-phase phrases. For fast downloads where both apply in the same poll, the user sees a brief "Downloading..." flash before the latched "Installing update...". For slow downloads the size/percentage ticks visibly upward, then transitions to "Installing update..." once an install-phase phrase appears. Once $installPhase latches it never reverts.
     9.46 - FEATURE: Prevent the system from entering sleep while a remediation run is in flight. Long winget downloads or per-app dialog timeouts can be killed by the OS going to sleep mid-upgrade - especially on laptops on battery with short idle timers. New Set-SystemSleepBlocked helper uses kernel32 SetThreadExecutionState with ES_CONTINUOUS|ES_SYSTEM_REQUIRED (we deliberately do NOT set ES_DISPLAY_REQUIRED, so the display still dims/blanks normally - we only need the kernel awake). Block is applied right after the marker-cleanup init, covering all subsequent work: task-file load, deferral checks, dialog host startup, per-app prompts, winget downloads, post-upgrade verification, user-context handoff polling. PowerShell.Exiting engine event clears the block on every exit path - 7 in total - so the log records "Sleep block cleared" and the flag is gone even on the test/error exits that don't go through the normal cleanup. SetThreadExecutionState is process-scoped, so if the script crashes Windows reclaims it automatically; the explicit clear is just hygiene.
@@ -8179,20 +8180,29 @@ if ($rawTaskList -and $rawTaskList.Count -gt 0) {
     $allowedScopes = if ($isSystem) { @("machine", "unknown") } else { @("user", "unknown") }
     $filtered = [System.Collections.ArrayList]::new()
     $skippedIds = [System.Collections.ArrayList]::new()
+    # v9.49: track unknown-scope tasks SYSTEM keeps for itself. When SYSTEM can't actually
+    # upgrade a per-user install (no machine uninstall key, so winget from SYSTEM sees nothing
+    # to do and exits with no output), we still want user-context to retry. So flag these so
+    # the user-context handoff fires after SYSTEM's loop even if no tasks were strictly
+    # "skipped" to the other context.
+    $unknownAlsoOther = [System.Collections.ArrayList]::new()
     foreach ($t in $rawTaskList) {
         $taskScope = if ($t.InstalledScope) { $t.InstalledScope } else { "unknown" }
         if ($allowedScopes -contains $taskScope) {
             $null = $filtered.Add($t)
+            if ($isSystem -and $taskScope -eq "unknown") {
+                $null = $unknownAlsoOther.Add("$($t.AppID)[unknown]")
+            }
         } else {
             $null = $skippedIds.Add("$($t.AppID)[$taskScope]")
         }
     }
     $LIST = $filtered
-    $Script:TasksForOtherContext = $skippedIds.Count
-    $Script:OtherContextAppIds = @($skippedIds)
+    $Script:TasksForOtherContext = $skippedIds.Count + $unknownAlsoOther.Count
+    $Script:OtherContextAppIds = @($skippedIds + $unknownAlsoOther)
     $contextLabel = if ($isSystem) { "SYSTEM" } else { "user" }
     $listCount = $LIST.Count
-    Write-Log -Message "Task file: $($rawTaskList.Count) entries, $listCount routed to $contextLabel context, $($skippedIds.Count) left for the other context"
+    Write-Log -Message "Task file: $($rawTaskList.Count) entries, $listCount routed to $contextLabel context, $($skippedIds.Count) left for the other context, $($unknownAlsoOther.Count) unknown-scope also routed to other for retry"
     if ($listCount -gt 0) {
         $hereIds = ($LIST | ForEach-Object { "$($_.AppID)[$(if ($_.InstalledScope) { $_.InstalledScope } else { 'unknown' })]" }) -join ', '
         Write-Log -Message "$contextLabel work list: $hereIds"
