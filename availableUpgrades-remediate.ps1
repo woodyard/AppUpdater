@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.41
- Tag: 41
+ Version: 9.42
+ Tag: 42
     
     Version History:
     1.0 - Initial version
@@ -105,6 +105,7 @@
     9.38 - FIX: When the per-app loop ended without processing any apps (e.g. the only app in the task file was actively deferred and got skipped), the script still sent a `complete` command to the dialog host. The host briefly rendered "Updates complete - 0 apps processed" with its 3-second auto-hide, but Stop-DialogHost fired immediately after and force-killed the host process within ~1 s, producing a visible sub-second flash of the completion panel even though the run was a no-op. Now the final `complete` command is gated on $count -gt 0 so a no-op run leaves the host hidden through teardown.
     9.39 - FIX: WingetUpgradeManager registry state (Deferrals, Failures, ReleaseCache) was being read/written via PSDrive paths like HKLM:\SOFTWARE\WingetUpgradeManager\..., which the Windows WoW64 redirector silently rewrites to HKLM:\SOFTWARE\WOW6432Node\... when the host process is 32-bit. Intune Remediations default to a 32-bit PowerShell host, so all script writes went to WOW6432Node; anything reading from a 64-bit context (manual PowerShell prompt, ad-hoc tooling) saw an empty/stale view. A user with an active Notepad++ deferral was invisible to a 64-bit Get-ChildItem on the non-WOW path while clearly visible at the WOW6432Node path. Fix: introduced $Script:WumRegRoot pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager and routed all 12 call sites through it (later renamed to $Script:AppRegRoot in v9.40). Both 32-bit and 64-bit PowerShell hosts now hit the same physical hive. Chose WOW6432Node-pinned (not 64-bit-pinned via .NET OpenBaseKey) because existing data is already at WOW6432Node from prior 32-bit Intune runs, so no migration is required; the trade-off is that orphaned entries written to the native HKLM:\SOFTWARE\WingetUpgradeManager by old 64-bit runs become invisible to the script (acceptable: those entries were already stale or expired).
     9.40 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot to match. No automatic migration of state from the old WingetUpgradeManager path - existing deferrals, failures, and release cache entries become orphaned. On the next run the script sees an empty state, so users will be re-prompted for any apps with pending updates instead of having their previously-set deferrals honored. Manual cleanup of the orphaned old key is up to the operator: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager' -Recurse -Force.
+    9.42 - FIX: v9.39's "pin registry path to WOW6432Node" approach was based on the wrong WoW64 semantics. PSDrive registry cmdlets (Get-ItemProperty, Set-ItemProperty, etc.) go through the WoW64 redirector, which from a 32-bit PowerShell host rewrites HKLM:\SOFTWARE\X to HKLM:\SOFTWARE\WOW6432Node\X *unconditionally* - it does not notice that WOW6432Node is already in the requested path. So v9.39's writes to HKLM:\SOFTWARE\WOW6432Node\AppUpdater\Deferrals\... actually landed at HKLM:\SOFTWARE\WOW6432Node\WOW6432Node\AppUpdater\Deferrals\... (confirmed in field: Notepad++.Notepad++ deferral with the v9.41 ACL fix was discovered at the double-WOW path). Proper fix: introduced Open-AppRegKey / Test-AppRegKey / Get-AppRegValue / Get-AppRegProperties / Set-AppRegValue / Remove-AppRegValue / Remove-AppRegKey / Get-AppRegChildKeyNames helpers that use [Microsoft.Win32.RegistryKey]::OpenBaseKey(LocalMachine, Registry64), explicitly requesting the 64-bit view and bypassing the redirector entirely. All 12 PSDrive call sites in remediate.ps1 (Initialize-DeferralRegistry, Get-AppReleaseDate, Get-DeferralStatus, Set-WhitelistedAppDeferral, the deferral/cache cleanup, and the four Get/Set/Clear-VersionFailure functions) routed through the helpers. Data now lives at HKLM:\SOFTWARE\AppUpdater (visible from any 32-bit OR 64-bit observer at the natural path). Existing state at HKLM:\SOFTWARE\WOW6432Node\WOW6432Node\AppUpdater is orphaned with no automatic migration. Operator cleanup: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WOW6432Node\AppUpdater' -Recurse -Force.
     9.41 - FIX: Real root cause of "host died mid-prompt" and the "two dialogs on screen" symptom. SYSTEM creates the session IPC files (CmdFile, CursorFile, HeartbeatFile) in C:\ProgramData\Temp, where the default ACL gives CREATOR OWNER (i.e. SYSTEM) full control and Users only read. The user-context host process can therefore READ the cmd file but its WriteAllText on CursorFile and HeartbeatFile silently fails with "Access denied". The previous code swallowed those failures in a no-op catch, so the heartbeat file timestamp never refreshed - and ~10 s after host startup, the parent's Test-DialogHostAlive declared the host dead based on stale heartbeat while the host was alive and rendering a dialog. Send-DialogCommand then returned $null, the v9.36 wrapper fell through to the legacy spawn, and the user saw the legacy dialog appear on top of the still-up host dialog. Two fixes: (a) Start-DialogHost now explicitly grants the interactive user Modify rights on CmdFile/CursorFile/HeartbeatFile (via SetAccessRule) and on the ReplyDir (via inherited Modify) immediately after creating them, so the host can actually write its own heartbeat. (b) The pump's heartbeat-write catch now logs the first failure via Write-DH (suppresses repeats) instead of silently swallowing, so any future ACL/IO failure shows up immediately in the host log instead of producing a mysterious false-positive 10 s later. With these in place, the dialog host should remain provably alive throughout a 120 s prompt - no fallback spawn, one dialog on screen, then teardown when the user clicks Defer or Update Now.
 
     Exit Codes:
@@ -4215,23 +4216,12 @@ function Initialize-DeferralRegistry {
     #>
     
     try {
-        $deferralPath = "$Script:AppRegRoot\Deferrals"
-        $cachePath = "$Script:AppRegRoot\ReleaseCache"
-        
-        if (-not (Test-Path $deferralPath)) {
-            Write-Log "Creating deferral registry path: $deferralPath" | Out-Null
-            New-Item -Path $deferralPath -Force | Out-Null
-        }
-        
-        if (-not (Test-Path $cachePath)) {
-            Write-Log "Creating release cache registry path: $cachePath" | Out-Null
-            New-Item -Path $cachePath -Force | Out-Null
-        }
-
-        $failurePath = "$Script:AppRegRoot\Failures"
-        if (-not (Test-Path $failurePath)) {
-            Write-Log "Creating failure tracking registry path: $failurePath" | Out-Null
-            New-Item -Path $failurePath -Force | Out-Null
+        foreach ($sub in @('Deferrals', 'ReleaseCache', 'Failures')) {
+            if (-not (Test-AppRegKey -SubPath $sub)) {
+                Write-Log "Creating AppUpdater registry path: $(Get-AppRegDisplayPath -SubPath $sub)" | Out-Null
+                $k = Open-AppRegKey -SubPath $sub -Writable
+                if ($k) { $k.Close() }
+            }
         }
 
         return $true
@@ -4269,13 +4259,12 @@ function Get-AppReleaseDate {
         
         # Create cache key - include version in key if specified
         $cacheKey = if ($Version) { "$AppID-$Version" } else { $AppID }
-        $cachePath = "$Script:AppRegRoot\ReleaseCache"
-        
+
         # Check cache first
         try {
-            $cachedDate = Get-ItemProperty -Path $cachePath -Name $cacheKey -ErrorAction SilentlyContinue
-            if ($cachedDate) {
-                $releaseDate = [DateTime]::Parse($cachedDate.$cacheKey)
+            $cachedDateStr = Get-AppRegValue -SubPath 'ReleaseCache' -Name $cacheKey
+            if ($cachedDateStr) {
+                $releaseDate = [DateTime]::Parse($cachedDateStr)
                 Write-Log "Found cached release date for $cacheKey : $releaseDate" | Out-Null
                 return $releaseDate
             }
@@ -4331,7 +4320,7 @@ function Get-AppReleaseDate {
             # If we found a valid date, cache it
             if ($releaseDate) {
                 try {
-                    Set-ItemProperty -Path $cachePath -Name $cacheKey -Value $releaseDate.ToString("yyyy-MM-dd HH:mm:ss") -Force
+                    Set-AppRegValue -SubPath 'ReleaseCache' -Name $cacheKey -Value $releaseDate.ToString("yyyy-MM-dd HH:mm:ss") | Out-Null
                     Write-Log "Cached release date for $cacheKey : $releaseDate" | Out-Null
                 } catch {
                     Write-Log "Failed to cache release date: $($_.Exception.Message)" | Out-Null
@@ -4380,10 +4369,10 @@ function Get-DeferralStatus {
     
     try {
         Initialize-DeferralRegistry | Out-Null
-        
-        $deferralPath = "$Script:AppRegRoot\Deferrals\$AppID"
+
+        $deferralSub = "Deferrals\$AppID"
         $now = Get-Date
-        
+
         # Default status - no deferrals
         $status = @{
             DeferralEnabled = $WhitelistConfig.DeferralEnabled -eq $true
@@ -4411,20 +4400,17 @@ function Get-DeferralStatus {
         if (-not $releaseDate) {
             # No release date from winget - use FirstDetected date as fallback
             # This ensures AdminHardDeadline is always calculated
-            if (Test-Path $deferralPath) {
-                $existingData = Get-ItemProperty -Path $deferralPath -ErrorAction SilentlyContinue
-                if ($existingData.FirstDetected) {
-                    $releaseDate = [DateTime]::Parse($existingData.FirstDetected)
+            if (Test-AppRegKey -SubPath $deferralSub) {
+                $firstDetected = Get-AppRegValue -SubPath $deferralSub -Name 'FirstDetected'
+                if ($firstDetected) {
+                    $releaseDate = [DateTime]::Parse($firstDetected)
                     Write-Log "Using stored FirstDetected date for ${AppID}: $($releaseDate.ToString('yyyy-MM-dd'))" | Out-Null
                 }
             }
             if (-not $releaseDate) {
                 # First time seeing this app - record today as first detected
                 $releaseDate = $now
-                if (-not (Test-Path $deferralPath)) {
-                    New-Item -Path $deferralPath -Force | Out-Null
-                }
-                Set-ItemProperty -Path $deferralPath -Name "FirstDetected" -Value $now.ToString("o")
+                Set-AppRegValue -SubPath $deferralSub -Name 'FirstDetected' -Value $now.ToString('o') | Out-Null
                 Write-Log "No release date found for ${AppID}, recording first detection date: $($now.ToString('yyyy-MM-dd'))" | Out-Null
             }
         }
@@ -4434,19 +4420,19 @@ function Get-DeferralStatus {
         $status.AdminHardDeadline = $releaseDate.AddDays($status.MaxDeferralDays)
         
         # Check if deferral data exists
-        if (Test-Path $deferralPath) {
+        if (Test-AppRegKey -SubPath $deferralSub) {
             try {
-                $deferralData = Get-ItemProperty -Path $deferralPath -ErrorAction SilentlyContinue
+                $deferralData = Get-AppRegProperties -SubPath $deferralSub
                 if ($deferralData) {
                     # Parse existing deferral data
                     if ($deferralData.DeferralsUsed) {
                         $status.DeferralsUsed = [int]$deferralData.DeferralsUsed
                     }
-                    
+
                     if ($deferralData.LastDeferralDate) {
                         $status.LastDeferralDate = [DateTime]::Parse($deferralData.LastDeferralDate)
                     }
-                    
+
                     if ($deferralData.UserDeadline) {
                         $status.UserDeadline = [DateTime]::Parse($deferralData.UserDeadline)
                     }
@@ -4547,33 +4533,28 @@ function Set-DeferralChoice {
     try {
         Initialize-DeferralRegistry | Out-Null
         
-        $deferralPath = "$Script:AppRegRoot\Deferrals\$AppID"
+        $deferralSub = "Deferrals\$AppID"
         $now = Get-Date
-        
-        # Ensure the app-specific path exists
-        if (-not (Test-Path $deferralPath)) {
-            New-Item -Path $deferralPath -Force | Out-Null
-        }
-        
-        # Get current deferral count
+
+        # Get current deferral count (CreateSubKey via Set-AppRegValue ensures the key exists)
         $currentDeferrals = 0
         try {
-            $existing = Get-ItemProperty -Path $deferralPath -Name "DeferralsUsed" -ErrorAction SilentlyContinue
-            if ($existing) {
-                $currentDeferrals = [int]$existing.DeferralsUsed
+            $existing = Get-AppRegValue -SubPath $deferralSub -Name 'DeferralsUsed'
+            if ($null -ne $existing) {
+                $currentDeferrals = [int]$existing
             }
         } catch {
             # Use default of 0
         }
-        
+
         # Calculate new user deadline: end of today, clamped to admin hard deadline
         $endOfDay = $now.Date.AddDays(1).AddSeconds(-1)  # today 23:59:59
         $userDeadline = if ($AdminHardDeadline -and $endOfDay -gt $AdminHardDeadline) { $AdminHardDeadline } else { $endOfDay }
 
         # Update deferral data
-        Set-ItemProperty -Path $deferralPath -Name "DeferralsUsed" -Value ($currentDeferrals + 1) -Force
-        Set-ItemProperty -Path $deferralPath -Name "LastDeferralDate" -Value $now.ToString("yyyy-MM-dd HH:mm:ss") -Force
-        Set-ItemProperty -Path $deferralPath -Name "UserDeadline" -Value $userDeadline.ToString("yyyy-MM-dd HH:mm:ss") -Force
+        Set-AppRegValue -SubPath $deferralSub -Name 'DeferralsUsed' -Value ($currentDeferrals + 1) | Out-Null
+        Set-AppRegValue -SubPath $deferralSub -Name 'LastDeferralDate' -Value $now.ToString("yyyy-MM-dd HH:mm:ss") | Out-Null
+        Set-AppRegValue -SubPath $deferralSub -Name 'UserDeadline' -Value $userDeadline.ToString("yyyy-MM-dd HH:mm:ss") | Out-Null
 
         Write-Log "Recorded deferral for ${AppID}: deferred until $($userDeadline.ToString('yyyy-MM-dd HH:mm:ss'))$(if ($AdminHardDeadline -and $endOfDay -gt $AdminHardDeadline) { ' (clamped to admin deadline)' })" | Out-Null
         
@@ -5541,63 +5522,57 @@ function Clear-ExpiredDeferralData {
     
     try {
         Write-Log "Starting deferral data cleanup" | Out-Null
-        
-        $deferralBasePath = "$Script:AppRegRoot\Deferrals"
-        $cacheBasePath = "$Script:AppRegRoot\ReleaseCache"
+
         $now = Get-Date
         $cleanupCount = 0
-        
+
         # Clean up expired deferral data (older than 90 days)
-        if (Test-Path $deferralBasePath) {
-            $appKeys = Get-ChildItem -Path $deferralBasePath -ErrorAction SilentlyContinue
-            foreach ($appKey in $appKeys) {
-                try {
-                    $deferralData = Get-ItemProperty -Path $appKey.PSPath -ErrorAction SilentlyContinue
-                    if ($deferralData -and $deferralData.LastDeferralDate) {
-                        $lastDeferral = [DateTime]::Parse($deferralData.LastDeferralDate)
-                        if (($now - $lastDeferral).Days -gt 90) {
-                            Remove-Item -Path $appKey.PSPath -Recurse -Force -ErrorAction SilentlyContinue
-                            Write-Log "Removed expired deferral data for: $($appKey.PSChildName)" | Out-Null
-                            $cleanupCount++
-                        }
-                    }
-                } catch {
-                    Write-Log "Error processing deferral cleanup for $($appKey.PSChildName): $($_.Exception.Message)" | Out-Null
-                }
-            }
-        }
-        
-        # Clean up old release cache entries (older than 30 days)
-        if (Test-Path $cacheBasePath) {
+        $appNames = Get-AppRegChildKeyNames -SubPath 'Deferrals'
+        foreach ($appName in $appNames) {
             try {
-                $cacheData = Get-ItemProperty -Path $cacheBasePath -ErrorAction SilentlyContinue
-                if ($cacheData) {
-                    $propertiesToRemove = @()
-                    foreach ($property in $cacheData.PSObject.Properties) {
-                        if ($property.Name -notlike "PS*") {  # Skip PowerShell built-in properties
-                            try {
-                                # Try to parse as date to see if it's old
-                                $cacheDate = [DateTime]::Parse($property.Value)
-                                if (($now - $cacheDate).Days -gt 30) {
-                                    $propertiesToRemove += $property.Name
-                                }
-                            } catch {
-                                # If we can't parse the date, it might be malformed - remove it
-                                $propertiesToRemove += $property.Name
-                            }
-                        }
-                    }
-                    
-                    foreach ($propName in $propertiesToRemove) {
-                        Remove-ItemProperty -Path $cacheBasePath -Name $propName -ErrorAction SilentlyContinue
+                $sub = "Deferrals\$appName"
+                $deferralData = Get-AppRegProperties -SubPath $sub
+                if ($deferralData -and $deferralData.LastDeferralDate) {
+                    $lastDeferral = [DateTime]::Parse($deferralData.LastDeferralDate)
+                    if (($now - $lastDeferral).Days -gt 90) {
+                        Remove-AppRegKey -SubPath $sub | Out-Null
+                        Write-Log "Removed expired deferral data for: $appName" | Out-Null
                         $cleanupCount++
                     }
                 }
             } catch {
-                Write-Log "Error during cache cleanup: $($_.Exception.Message)" | Out-Null
+                Write-Log "Error processing deferral cleanup for $appName : $($_.Exception.Message)" | Out-Null
             }
         }
-        
+
+        # Clean up old release cache entries (older than 30 days)
+        try {
+            $cacheData = Get-AppRegProperties -SubPath 'ReleaseCache'
+            if ($cacheData) {
+                $propertiesToRemove = @()
+                foreach ($property in $cacheData.PSObject.Properties) {
+                    if ($property.Name -notlike "PS*") {  # Skip PowerShell built-in properties
+                        try {
+                            $cacheDate = [DateTime]::Parse($property.Value)
+                            if (($now - $cacheDate).Days -gt 30) {
+                                $propertiesToRemove += $property.Name
+                            }
+                        } catch {
+                            # If we can't parse the date, it might be malformed - remove it
+                            $propertiesToRemove += $property.Name
+                        }
+                    }
+                }
+
+                foreach ($propName in $propertiesToRemove) {
+                    Remove-AppRegValue -SubPath 'ReleaseCache' -Name $propName | Out-Null
+                    $cleanupCount++
+                }
+            }
+        } catch {
+            Write-Log "Error during cache cleanup: $($_.Exception.Message)" | Out-Null
+        }
+
         Write-Log "Deferral cleanup completed: $cleanupCount items removed" | Out-Null
         
     } catch {
@@ -5624,9 +5599,9 @@ function Get-VersionFailureData {
     )
     $default = @{ FailureCount = 0; IsSkipped = $false }
     try {
-        $path = "$Script:AppRegRoot\Failures\$AppID"
-        if (-not (Test-Path $path)) { return $default }
-        $data = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+        $sub = "Failures\$AppID"
+        if (-not (Test-AppRegKey -SubPath $sub)) { return $default }
+        $data = Get-AppRegProperties -SubPath $sub
         if (-not $data -or $data.FailedVersion -ne $Version) { return $default }
         return @{
             FailureCount = [int]($data.FailureCount)
@@ -5647,14 +5622,13 @@ function Set-VersionFailure {
         [Parameter(Mandatory)][string]$Version
     )
     try {
-        $path = "$Script:AppRegRoot\Failures\$AppID"
-        if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
-        $existing = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+        $sub = "Failures\$AppID"
+        $existing = Get-AppRegProperties -SubPath $sub
         $count = if ($existing -and $existing.FailedVersion -eq $Version) { [int]$existing.FailureCount + 1 } else { 1 }
-        Set-ItemProperty -Path $path -Name "FailedVersion" -Value $Version
-        Set-ItemProperty -Path $path -Name "FailureCount"  -Value $count -Type DWord
-        Set-ItemProperty -Path $path -Name "Skipped"       -Value "false"
-        Set-ItemProperty -Path $path -Name "LastFailure"   -Value (Get-Date -Format "o")
+        Set-AppRegValue -SubPath $sub -Name 'FailedVersion' -Value $Version | Out-Null
+        Set-AppRegValue -SubPath $sub -Name 'FailureCount'  -Value ([int]$count) | Out-Null
+        Set-AppRegValue -SubPath $sub -Name 'Skipped'       -Value 'false' | Out-Null
+        Set-AppRegValue -SubPath $sub -Name 'LastFailure'   -Value (Get-Date -Format "o") | Out-Null
         return $count
     } catch {
         Write-Log "Error recording version failure for $AppID`: $($_.Exception.Message)" | Out-Null
@@ -5672,11 +5646,10 @@ function Set-VersionSkipped {
         [Parameter(Mandatory)][string]$Version
     )
     try {
-        $path = "$Script:AppRegRoot\Failures\$AppID"
-        New-Item -Path $path -Force | Out-Null
-        Set-ItemProperty -Path $path -Name "FailedVersion" -Value $Version
-        Set-ItemProperty -Path $path -Name "Skipped"       -Value "true"
-        Set-ItemProperty -Path $path -Name "SkippedAt"     -Value (Get-Date -Format "o")
+        $sub = "Failures\$AppID"
+        Set-AppRegValue -SubPath $sub -Name 'FailedVersion' -Value $Version | Out-Null
+        Set-AppRegValue -SubPath $sub -Name 'Skipped'       -Value 'true' | Out-Null
+        Set-AppRegValue -SubPath $sub -Name 'SkippedAt'     -Value (Get-Date -Format "o") | Out-Null
         Write-Log "Marked $AppID version $Version as skipped by user" | Out-Null
     } catch {
         Write-Log "Error marking version as skipped for $AppID`: $($_.Exception.Message)" | Out-Null
@@ -5690,9 +5663,9 @@ function Clear-VersionFailureData {
     #>
     param([Parameter(Mandatory)][string]$AppID)
     try {
-        $path = "$Script:AppRegRoot\Failures\$AppID"
-        if (Test-Path $path) {
-            Remove-Item -Path $path -Force | Out-Null
+        $sub = "Failures\$AppID"
+        if (Test-AppRegKey -SubPath $sub) {
+            Remove-AppRegKey -SubPath $sub | Out-Null
             Write-Log "Cleared failure tracking data for $AppID" | Out-Null
         }
     } catch {
@@ -6982,13 +6955,101 @@ $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy # EU format; per-day rollover so all runs in one day share a log file
 $LogFullName = "$LogName-$LogDate.log"
 
-# v9.40: AppUpdater registry root (renamed from WingetUpgradeManager to match the repo name).
-# Pinned to WOW6432Node so a 32-bit PowerShell host (Intune Remediations default) and a 64-bit
-# one both read/write the same physical hive. Without this pin, writes from a 32-bit run got
-# WoW64-redirected into WOW6432Node while writes from a 64-bit run landed in the native view,
-# splitting deferral state across two invisible-to-each-other locations. Prior state (under
-# WingetUpgradeManager) is intentionally orphaned on this rename - clear it manually if you care.
-$Script:AppRegRoot = 'HKLM:\SOFTWARE\WOW6432Node\AppUpdater'
+# v9.42: AppUpdater registry helpers. Access HKLM:\SOFTWARE\AppUpdater via .NET's
+# RegistryKey.OpenBaseKey(LocalMachine, Registry64) so we explicitly request the 64-bit view
+# and bypass the WoW64 redirector. PSDrive cmdlets (Get-ItemProperty, Set-ItemProperty, etc.)
+# go through the redirector - from a 32-bit PowerShell host (Intune Remediations default), they
+# rewrite HKLM:\SOFTWARE\X to HKLM:\SOFTWARE\WOW6432Node\X *unconditionally*, even when WOW6432Node
+# is already in the requested path (yielding ...WOW6432Node\WOW6432Node\X). v9.39's
+# WOW6432Node-prefix approach therefore produced double-redirected writes that were invisible at
+# the path the script intended. These helpers take that pain away: same physical hive at
+# HKLM:\SOFTWARE\AppUpdater regardless of bitness, visible to any 64-bit observer at the
+# natural-looking path.
+$Script:AppRegBasePath    = 'SOFTWARE\AppUpdater'         # under the 64-bit view
+$Script:AppRegDisplayRoot = 'HKLM:\SOFTWARE\AppUpdater'   # for log messages only
+
+function Open-AppRegKey {
+    param([string]$SubPath = '', [switch]$Writable)
+    try {
+        $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::LocalMachine,
+            [Microsoft.Win32.RegistryView]::Registry64)
+        $full = $Script:AppRegBasePath
+        if ($SubPath) { $full = "$full\$SubPath" }
+        if ($Writable) { return $hklm.CreateSubKey($full) }
+        return $hklm.OpenSubKey($full, $false)
+    } catch {
+        return $null
+    }
+}
+
+function Test-AppRegKey {
+    param([string]$SubPath)
+    $k = Open-AppRegKey -SubPath $SubPath
+    if ($k) { $k.Close(); return $true }
+    return $false
+}
+
+function Get-AppRegValue {
+    param([string]$SubPath, [string]$Name, $Default = $null)
+    $k = Open-AppRegKey -SubPath $SubPath
+    if (-not $k) { return $Default }
+    try {
+        $v = $k.GetValue($Name)
+        if ($null -eq $v) { return $Default } else { return $v }
+    } finally { $k.Close() }
+}
+
+function Get-AppRegProperties {
+    param([string]$SubPath)
+    $k = Open-AppRegKey -SubPath $SubPath
+    if (-not $k) { return $null }
+    try {
+        $h = [ordered]@{}
+        foreach ($n in $k.GetValueNames()) { $h[$n] = $k.GetValue($n) }
+        return [PSCustomObject]$h
+    } finally { $k.Close() }
+}
+
+function Set-AppRegValue {
+    param([string]$SubPath, [string]$Name, $Value)
+    $k = Open-AppRegKey -SubPath $SubPath -Writable
+    if (-not $k) { return $false }
+    try { $k.SetValue($Name, $Value); return $true } finally { $k.Close() }
+}
+
+function Remove-AppRegValue {
+    param([string]$SubPath, [string]$Name)
+    $k = Open-AppRegKey -SubPath $SubPath -Writable
+    if (-not $k) { return $false }
+    try { $k.DeleteValue($Name, $false); return $true } finally { $k.Close() }
+}
+
+function Remove-AppRegKey {
+    param([string]$SubPath)
+    try {
+        $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::LocalMachine,
+            [Microsoft.Win32.RegistryView]::Registry64)
+        $full = $Script:AppRegBasePath
+        if ($SubPath) { $full = "$full\$SubPath" }
+        $hklm.DeleteSubKeyTree($full, $false)
+        return $true
+    } catch { return $false }
+}
+
+function Get-AppRegChildKeyNames {
+    param([string]$SubPath = '')
+    $k = Open-AppRegKey -SubPath $SubPath
+    if (-not $k) { return @() }
+    try { return ,@($k.GetSubKeyNames()) } finally { $k.Close() }
+}
+
+function Get-AppRegDisplayPath {
+    param([string]$SubPath = '')
+    if ($SubPath) { return "$Script:AppRegDisplayRoot\$SubPath" }
+    return $Script:AppRegDisplayRoot
+}
 
 # Capture script path at global scope for use in scheduled tasks
 $Global:CurrentScriptPath = $MyInvocation.MyCommand.Path

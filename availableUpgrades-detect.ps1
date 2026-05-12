@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.50
-    Tag: 80
+    Version: 5.51
+    Tag: 81
     
     Version History:
     1.0 - Initial version
@@ -97,6 +97,7 @@
     5.48 - TUNE: $LogDate dropped its _HH-mm component, so all detection runs on the same calendar day now append to a single DetectAvailableUpgrades-DD-MM-YY.log file instead of producing a new file per session. Mirrors remediate.ps1 v9.35. Remove-OldLogs's 1-month retention is unchanged.
     5.49 - FIX: WingetUpgradeManager deferral reads were going through PSDrive HKLM:\SOFTWARE\WingetUpgradeManager\..., which the WoW64 redirector rewrites to WOW6432Node for 32-bit PowerShell hosts. Combined with remediate.ps1 also being WoW64-redirected when run from Intune (32-bit default), data was effectively at WOW6432Node but invisible to 64-bit ad-hoc inspection. Switched the one deferral-read site here to $Script:WumRegRoot (pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager; later renamed to $Script:AppRegRoot in v5.50) so detect.ps1 and remediate.ps1 v9.39 always agree on where deferral state lives regardless of host bitness.
     5.50 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot. Mirrors remediate.ps1 v9.40. No automatic migration - existing state at the old path is orphaned.
+    5.51 - FIX: PSDrive registry access was being double-redirected by WoW64 (see remediate.ps1 v9.42 for the full diagnosis). Switched the one deferral-read site here to Open-AppRegKey / Get-AppRegValue / Test-AppRegKey helpers that go through [Microsoft.Win32.RegistryKey]::OpenBaseKey(LocalMachine, Registry64). Detect and remediate now both read/write at HKLM:\SOFTWARE\AppUpdater regardless of host bitness.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -1555,10 +1556,54 @@ $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy # EU format; per-day rollover so all runs in one day share a log file
 $LogFullName = "$LogName-$LogDate.log"
 
-# v5.50: AppUpdater registry root (renamed from WingetUpgradeManager to match the repo name).
-# Pinned to WOW6432Node for the same bitness-consistency reason described in remediate.ps1.
-# Detect reads deferral state from this root; remediate writes it. Both must agree on the path.
-$Script:AppRegRoot = 'HKLM:\SOFTWARE\WOW6432Node\AppUpdater'
+# v5.51: AppUpdater registry helpers. Mirrors remediate.ps1 v9.42 - access HKLM:\SOFTWARE\AppUpdater
+# via .NET RegistryKey.OpenBaseKey(LocalMachine, Registry64) so we explicitly request the 64-bit
+# view and bypass the WoW64 redirector. PSDrive cmdlets go through the redirector and double-
+# redirect when WOW6432Node is in the path, so detect.ps1 must read deferral state the same way
+# remediate.ps1 writes it - via these helpers.
+$Script:AppRegBasePath    = 'SOFTWARE\AppUpdater'
+$Script:AppRegDisplayRoot = 'HKLM:\SOFTWARE\AppUpdater'
+
+function Open-AppRegKey {
+    param([string]$SubPath = '', [switch]$Writable)
+    try {
+        $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::LocalMachine,
+            [Microsoft.Win32.RegistryView]::Registry64)
+        $full = $Script:AppRegBasePath
+        if ($SubPath) { $full = "$full\$SubPath" }
+        if ($Writable) { return $hklm.CreateSubKey($full) }
+        return $hklm.OpenSubKey($full, $false)
+    } catch { return $null }
+}
+
+function Test-AppRegKey {
+    param([string]$SubPath)
+    $k = Open-AppRegKey -SubPath $SubPath
+    if ($k) { $k.Close(); return $true }
+    return $false
+}
+
+function Get-AppRegValue {
+    param([string]$SubPath, [string]$Name, $Default = $null)
+    $k = Open-AppRegKey -SubPath $SubPath
+    if (-not $k) { return $Default }
+    try {
+        $v = $k.GetValue($Name)
+        if ($null -eq $v) { return $Default } else { return $v }
+    } finally { $k.Close() }
+}
+
+function Get-AppRegProperties {
+    param([string]$SubPath)
+    $k = Open-AppRegKey -SubPath $SubPath
+    if (-not $k) { return $null }
+    try {
+        $h = [ordered]@{}
+        foreach ($n in $k.GetValueNames()) { $h[$n] = $k.GetValue($n) }
+        return [PSCustomObject]$h
+    } finally { $k.Close() }
+}
 
 # Capture script path at global scope for use in scheduled tasks
 $Global:CurrentScriptPath = $MyInvocation.MyCommand.Path
@@ -2111,15 +2156,15 @@ if ($LIST -and $LIST.Count -gt 0) {
                     if ($appId -like $okapp.AppID) {
                         # FAST DEFERRAL CHECK - Only check existing registry data (no expensive winget queries)
                         if ($okapp.DeferralEnabled -eq $true) {
-                            $deferralPath = "$Script:AppRegRoot\Deferrals\$appId"
+                            $deferralSub = "Deferrals\$appId"
                             $now = Get-Date
 
                             # Quick check - only look at existing user deadline (no expensive admin deadline calculation)
-                            if (Test-Path $deferralPath) {
+                            if (Test-AppRegKey -SubPath $deferralSub) {
                                 try {
-                                    $deferralData = Get-ItemProperty -Path $deferralPath -ErrorAction SilentlyContinue
-                                    if ($deferralData -and $deferralData.UserDeadline) {
-                                        $userDeadline = [DateTime]::Parse($deferralData.UserDeadline)
+                                    $userDeadlineStr = Get-AppRegValue -SubPath $deferralSub -Name 'UserDeadline'
+                                    if ($userDeadlineStr) {
+                                        $userDeadline = [DateTime]::Parse($userDeadlineStr)
                                         if ($now -lt $userDeadline) {
                                             $deferredApps += "$($okapp.AppID) (until $($userDeadline.ToString('dd.MM.yyyy HH:mm')))"
                                             Write-Log -Message "Skipping $($okapp.AppID) - user has deferred until $userDeadline"
