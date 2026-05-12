@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.45
- Tag: 45
+ Version: 9.46
+ Tag: 46
     
     Version History:
     1.0 - Initial version
@@ -105,6 +105,7 @@
     9.38 - FIX: When the per-app loop ended without processing any apps (e.g. the only app in the task file was actively deferred and got skipped), the script still sent a `complete` command to the dialog host. The host briefly rendered "Updates complete - 0 apps processed" with its 3-second auto-hide, but Stop-DialogHost fired immediately after and force-killed the host process within ~1 s, producing a visible sub-second flash of the completion panel even though the run was a no-op. Now the final `complete` command is gated on $count -gt 0 so a no-op run leaves the host hidden through teardown.
     9.39 - FIX: WingetUpgradeManager registry state (Deferrals, Failures, ReleaseCache) was being read/written via PSDrive paths like HKLM:\SOFTWARE\WingetUpgradeManager\..., which the Windows WoW64 redirector silently rewrites to HKLM:\SOFTWARE\WOW6432Node\... when the host process is 32-bit. Intune Remediations default to a 32-bit PowerShell host, so all script writes went to WOW6432Node; anything reading from a 64-bit context (manual PowerShell prompt, ad-hoc tooling) saw an empty/stale view. A user with an active Notepad++ deferral was invisible to a 64-bit Get-ChildItem on the non-WOW path while clearly visible at the WOW6432Node path. Fix: introduced $Script:WumRegRoot pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager and routed all 12 call sites through it (later renamed to $Script:AppRegRoot in v9.40). Both 32-bit and 64-bit PowerShell hosts now hit the same physical hive. Chose WOW6432Node-pinned (not 64-bit-pinned via .NET OpenBaseKey) because existing data is already at WOW6432Node from prior 32-bit Intune runs, so no migration is required; the trade-off is that orphaned entries written to the native HKLM:\SOFTWARE\WingetUpgradeManager by old 64-bit runs become invisible to the script (acceptable: those entries were already stale or expired).
     9.40 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot to match. No automatic migration of state from the old WingetUpgradeManager path - existing deferrals, failures, and release cache entries become orphaned. On the next run the script sees an empty state, so users will be re-prompted for any apps with pending updates instead of having their previously-set deferrals honored. Manual cleanup of the orphaned old key is up to the operator: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager' -Recurse -Force.
+    9.46 - FEATURE: Prevent the system from entering sleep while a remediation run is in flight. Long winget downloads or per-app dialog timeouts can be killed by the OS going to sleep mid-upgrade - especially on laptops on battery with short idle timers. New Set-SystemSleepBlocked helper uses kernel32 SetThreadExecutionState with ES_CONTINUOUS|ES_SYSTEM_REQUIRED (we deliberately do NOT set ES_DISPLAY_REQUIRED, so the display still dims/blanks normally - we only need the kernel awake). Block is applied right after the marker-cleanup init, covering all subsequent work: task-file load, deferral checks, dialog host startup, per-app prompts, winget downloads, post-upgrade verification, user-context handoff polling. PowerShell.Exiting engine event clears the block on every exit path - 7 in total - so the log records "Sleep block cleared" and the flag is gone even on the test/error exits that don't go through the normal cleanup. SetThreadExecutionState is process-scoped, so if the script crashes Windows reclaims it automatically; the explicit clear is just hygiene.
     9.45 - FIX: Invoke-WingetWithProgress's monitoring loop was being skipped entirely when the dialog host was alive. When v9.33 wired Show-UpgradeProgressNotification to return $null on the host path (so the legacy signal-file flow no-ops), the caller passed SignalFilePath=$null to Invoke-WingetWithProgress. The function's early-return-on-no-SignalFilePath check then took the direct-execution path - no stdout file, no monitoring loop, no Write-InfoDialogStatus updates - so the dialog stayed frozen on the initial "Preparing download..." for the entire upgrade. None of v9.44's regex improvements ever ran on the host-alive path. Fix: the early-return now also checks Test-DialogHostAlive, so when the host is alive the monitoring loop runs and Write-InfoDialogStatus inside it ships size / percentage / installing updates to the host.
     9.44 - UX: Dialog status during winget upgrade is more informative. Initial status is now "Preparing download..." instead of "Downloading update..." so the user can see when bytes actually start moving. Invoke-WingetWithProgress now (a) accepts B/KB/MB/GB on both sides of the X / Y size regex (was KB|MB / MB|GB only, which silently failed on small/very-large downloads), (b) falls back to a "Downloading XX%" status when only a percentage is parseable (newer winget builds render a unicode progress bar with no inline size), and (c) latches into an "Installing update..." status the first time it sees Successfully installed / Successfully verified installer hash / Starting package install / Starting installer / "^Installing" / Configuring - so the dialog stops saying "Downloading" once the bytes are down. Install-phase detection also covers more winget output variants (1.5 used "Starting package install", 1.7+ uses "Starting installer").
     9.43 - FIX: On a freshly-set-up Windows machine the dialog host failed to start - parent logged "Dialog host did not heartbeat within 8 s" and fell back to legacy spawn, AND no preserved host log was produced. The host process actually started but died before its first Write-DH call. Root cause: when C:\ProgramData\Temp was freshly created by SYSTEM (Start-DialogHost's auto-create branch), it inherited C:\ProgramData's default ACL which grants Users only Read+Execute - not Create-File. v9.41's ACL fix granted the user Modify on the FILES that SYSTEM had pre-created (CmdFile/CursorFile/HeartbeatFile), but the host's very first action is to WriteAllText its OWN files (PidFile, LogFile, replies/*.json), and the user couldn't CREATE new files in the parent directory. The host's WriteAllText on PidFile threw Access Denied, the process died, no Write-DH ever fired, and the parent waited 8 s on a heartbeat that would never come. Two fixes: (a) Session files now live inside a per-session SUBDIRECTORY (C:\ProgramData\Temp\availableUpgrades-dialog-<id>\{cmd, cursor, heartbeat, pid, host.log, replies\}); SYSTEM creates that directory and grants the user Modify with ContainerInherit+ObjectInherit, so every file the host wants to create inside it just works. (b) Heartbeat wait window bumped from 8 s to 15 s to cover slow first-run WPF cold start. Stop-DialogHost moves the log out to a flat sibling location before removing the per-session directory, so log preservation still works.
@@ -220,6 +221,46 @@ function Get-ActiveUserSessions {
     } catch {
         Write-Log -Message "Error detecting user sessions: $($_.Exception.Message)" | Out-Null
         return @()
+    }
+}
+
+
+function Set-SystemSleepBlocked {
+    <#
+    .SYNOPSIS
+        Prevents (Block=$true) or allows (Block=$false) the system from entering sleep while
+        upgrades are in flight. Uses kernel32 SetThreadExecutionState - the request is
+        process-scoped, so if the script crashes Windows automatically reclaims it.
+    .DESCRIPTION
+        v9.46: long winget downloads or per-app dialog timeouts can be killed by the system
+        going to sleep mid-upgrade (especially on laptops on battery with short idle timers).
+        We pin the system awake for the duration of the per-app processing loop and clear it
+        on every exit path. We deliberately do NOT set ES_DISPLAY_REQUIRED so the user's
+        display still dims/blanks normally - we only need the kernel awake.
+    #>
+    param([bool]$Block)
+    try {
+        if (-not ('Win32.PowerControl' -as [Type])) {
+            Add-Type -Namespace Win32 -Name PowerControl -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern uint SetThreadExecutionState(uint esFlags);
+'@ -ErrorAction Stop
+        }
+        if ($Block) {
+            # ES_CONTINUOUS (0x80000000) | ES_SYSTEM_REQUIRED (0x00000001)
+            $r = [Win32.PowerControl]::SetThreadExecutionState(0x80000001)
+            if ($r -ne 0) {
+                Write-Log -Message "Sleep blocked for duration of upgrade run" | Out-Null
+            } else {
+                Write-Log -Message "SetThreadExecutionState returned 0 - sleep block may not be in effect" | Out-Null
+            }
+        } else {
+            # ES_CONTINUOUS alone clears all flags, restoring normal idle behavior
+            [Win32.PowerControl]::SetThreadExecutionState(0x80000000) | Out-Null
+            Write-Log -Message "Sleep block cleared" | Out-Null
+        }
+    } catch {
+        Write-Log -Message "Set-SystemSleepBlocked failed: $($_.Exception.Message)" | Out-Null
     }
 }
 
@@ -7115,6 +7156,15 @@ $userIsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole
 $useWhitelist = $true
 
 <# ----------------------------------------------- #>
+
+# v9.46: Pin the system awake for the whole remediation run. SetThreadExecutionState is
+# process-scoped so the flag dies with this PowerShell process - even on a crash, Windows
+# reclaims it automatically. The PowerShell.Exiting handler clears it explicitly on every
+# normal exit path (7 of them) for hygiene and so the log records "Sleep block cleared".
+Set-SystemSleepBlocked -Block $true
+Register-EngineEvent -SourceIdentifier PowerShell.Exiting -SupportEvent -Action {
+    try { Set-SystemSleepBlocked -Block $false } catch {}
+} | Out-Null
 
 # Initialize marker file management system (with guard to prevent double initialization)
 $Script:MarkerSystemInitialized = $false
