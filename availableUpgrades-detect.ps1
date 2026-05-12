@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.54
-    Tag: 84
+    Version: 5.55
+    Tag: 85
     
     Version History:
     1.0 - Initial version
@@ -97,6 +97,7 @@
     5.48 - TUNE: $LogDate dropped its _HH-mm component, so all detection runs on the same calendar day now append to a single DetectAvailableUpgrades-DD-MM-YY.log file instead of producing a new file per session. Mirrors remediate.ps1 v9.35. Remove-OldLogs's 1-month retention is unchanged.
     5.49 - FIX: WingetUpgradeManager deferral reads were going through PSDrive HKLM:\SOFTWARE\WingetUpgradeManager\..., which the WoW64 redirector rewrites to WOW6432Node for 32-bit PowerShell hosts. Combined with remediate.ps1 also being WoW64-redirected when run from Intune (32-bit default), data was effectively at WOW6432Node but invisible to 64-bit ad-hoc inspection. Switched the one deferral-read site here to $Script:WumRegRoot (pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager; later renamed to $Script:AppRegRoot in v5.50) so detect.ps1 and remediate.ps1 v9.39 always agree on where deferral state lives regardless of host bitness.
     5.50 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot. Mirrors remediate.ps1 v9.40. No automatic migration - existing state at the old path is orphaned.
+    5.55 - UX: Session-start banner written at the top of each run, mirrors remediate.ps1 v9.53. Three `=`-bordered lines that read "===== DetectAvailableUpgrades v5.55  PID 12345  SYSTEM context  on COMPUTERNAME". Version is read from .NOTES at runtime so it stays in sync without a separate constant.
     5.54 - TUNE: Remove-OldTempFiles cutoff bumped from 10 minutes to 60 minutes. Mirrors remediate.ps1 v9.51. The 10-minute window was too short for runs that process large packages - in-flight files for the current run could match the regex and be cleaned up during the run.
     5.53 - TUNE: Remove-OldTempFiles regex extended to include availableUpgrades-dialog-* (remediate's persistent dialog host artifacts) and the function now scans DIRECTORIES, not just files. Previously a crash inside remediate.ps1 that left the per-session dialog subdirectory (C:\ProgramData\Temp\availableUpgrades-dialog-<id>\) on disk meant the directory survived forever - the file-only cleanup couldn't see it. Mirrors remediate.ps1 v9.50.
     5.52 - FIX: Get-AppInstalledScope's search-term list included the standalone publisher prefix from a dotted AppID (e.g. "Microsoft" for Microsoft.VisualStudioCode, "Google" for Google.Chrome). For prolific publishers this matched dozens of unrelated uninstall entries - 97 hits for "Microsoft" was typical on a machine with VS Code, Office, Azure tools, etc. - and the path-hint heuristic then picked an InstallLocation sample from a completely unrelated entry (e.g. "Microsoft Shared\VSTO\10.0" as the sample for Microsoft.VisualStudioCode), driving the routing decision off a cliff. Observed in field: Microsoft.VisualStudioCode (per-user UserSetup install in %LOCALAPPDATA%) and Microsoft.Bicep (no uninstall key at all) were both classified as "machine" because of these false matches, so SYSTEM-context remediation accepted them and then quietly failed to upgrade them. Anthropic.Claude correctly returned "unknown" but was kept in SYSTEM's list with no user-context fallback. Fix: dropped the standalone $idParts[0] term from the search list. Joined "Vendor Product" and product-only $idParts[-1] terms remain, which are what actually match real DisplayNames.
@@ -1649,6 +1650,23 @@ if (Test-RunningAsSystem) {
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 $userIsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $useWhitelist = $true
+
+# v5.55: session-start banner so multiple runs in the same per-day log file are easy to
+# distinguish at a glance. Reads the Version field from the .NOTES block at runtime so it
+# stays in sync without a manual constant to maintain.
+$scriptVersion = 'unknown'
+try {
+    if ($Global:CurrentScriptPath -and (Test-Path $Global:CurrentScriptPath)) {
+        $hdr = Get-Content -Path $Global:CurrentScriptPath -TotalCount 40 -ErrorAction Stop
+        foreach ($line in $hdr) {
+            if ($line -match '^\s*Version:\s*(\S+)') { $scriptVersion = $Matches[1]; break }
+        }
+    }
+} catch {}
+$ctxLabel = if (Test-RunningAsSystem) { 'SYSTEM' } elseif ($userIsAdmin) { 'user (admin)' } else { 'user' }
+Write-Log -Message ('=' * 78)
+Write-Log -Message "===== DetectAvailableUpgrades v$scriptVersion  PID $PID  $ctxLabel context  on $env:COMPUTERNAME"
+Write-Log -Message ('=' * 78)
 
 <# ----------------------------------------------- #>
 
