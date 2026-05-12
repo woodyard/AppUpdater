@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.40
- Tag: 40
+ Version: 9.41
+ Tag: 41
     
     Version History:
     1.0 - Initial version
@@ -105,6 +105,7 @@
     9.38 - FIX: When the per-app loop ended without processing any apps (e.g. the only app in the task file was actively deferred and got skipped), the script still sent a `complete` command to the dialog host. The host briefly rendered "Updates complete - 0 apps processed" with its 3-second auto-hide, but Stop-DialogHost fired immediately after and force-killed the host process within ~1 s, producing a visible sub-second flash of the completion panel even though the run was a no-op. Now the final `complete` command is gated on $count -gt 0 so a no-op run leaves the host hidden through teardown.
     9.39 - FIX: WingetUpgradeManager registry state (Deferrals, Failures, ReleaseCache) was being read/written via PSDrive paths like HKLM:\SOFTWARE\WingetUpgradeManager\..., which the Windows WoW64 redirector silently rewrites to HKLM:\SOFTWARE\WOW6432Node\... when the host process is 32-bit. Intune Remediations default to a 32-bit PowerShell host, so all script writes went to WOW6432Node; anything reading from a 64-bit context (manual PowerShell prompt, ad-hoc tooling) saw an empty/stale view. A user with an active Notepad++ deferral was invisible to a 64-bit Get-ChildItem on the non-WOW path while clearly visible at the WOW6432Node path. Fix: introduced $Script:WumRegRoot pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager and routed all 12 call sites through it (later renamed to $Script:AppRegRoot in v9.40). Both 32-bit and 64-bit PowerShell hosts now hit the same physical hive. Chose WOW6432Node-pinned (not 64-bit-pinned via .NET OpenBaseKey) because existing data is already at WOW6432Node from prior 32-bit Intune runs, so no migration is required; the trade-off is that orphaned entries written to the native HKLM:\SOFTWARE\WingetUpgradeManager by old 64-bit runs become invisible to the script (acceptable: those entries were already stale or expired).
     9.40 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot to match. No automatic migration of state from the old WingetUpgradeManager path - existing deferrals, failures, and release cache entries become orphaned. On the next run the script sees an empty state, so users will be re-prompted for any apps with pending updates instead of having their previously-set deferrals honored. Manual cleanup of the orphaned old key is up to the operator: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager' -Recurse -Force.
+    9.41 - FIX: Real root cause of "host died mid-prompt" and the "two dialogs on screen" symptom. SYSTEM creates the session IPC files (CmdFile, CursorFile, HeartbeatFile) in C:\ProgramData\Temp, where the default ACL gives CREATOR OWNER (i.e. SYSTEM) full control and Users only read. The user-context host process can therefore READ the cmd file but its WriteAllText on CursorFile and HeartbeatFile silently fails with "Access denied". The previous code swallowed those failures in a no-op catch, so the heartbeat file timestamp never refreshed - and ~10 s after host startup, the parent's Test-DialogHostAlive declared the host dead based on stale heartbeat while the host was alive and rendering a dialog. Send-DialogCommand then returned $null, the v9.36 wrapper fell through to the legacy spawn, and the user saw the legacy dialog appear on top of the still-up host dialog. Two fixes: (a) Start-DialogHost now explicitly grants the interactive user Modify rights on CmdFile/CursorFile/HeartbeatFile (via SetAccessRule) and on the ReplyDir (via inherited Modify) immediately after creating them, so the host can actually write its own heartbeat. (b) The pump's heartbeat-write catch now logs the first failure via Write-DH (suppresses repeats) instead of silently swallowing, so any future ACL/IO failure shows up immediately in the host log instead of producing a mysterious false-positive 10 s later. With these in place, the dialog host should remain provably alive throughout a 120 s prompt - no fallback spawn, one dialog on screen, then teardown when the user clicks Defer or Update Now.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -369,6 +370,36 @@ function Start-DialogHost {
         Set-Content -Path $paths.CmdFile -Value "" -Encoding UTF8 -Force
         Set-Content -Path $paths.CursorFile -Value "0" -Encoding UTF8 -Force
         Set-Content -Path $paths.HeartbeatFile -Value (Get-Date -Format 'o') -Encoding UTF8 -Force
+
+        # v9.41: grant the interactive user Modify on every session IPC file. SYSTEM creates them
+        # so default ACL is "CREATOR OWNER = SYSTEM" - the user-context host process can read
+        # them but its WriteAllText on CursorFile/HeartbeatFile silently fails with "Access denied",
+        # the heartbeat file timestamp never refreshes, and after ~10 s Test-DialogHostAlive
+        # falsely declares the host dead while it's actually alive and rendering a dialog. The
+        # parent then spawns the legacy fallback dialog on top - the "two dialogs" symptom.
+        try {
+            $userSid = New-Object System.Security.Principal.SecurityIdentifier($userInfo.SID)
+            foreach ($f in @($paths.CmdFile, $paths.CursorFile, $paths.HeartbeatFile)) {
+                $acl = Get-Acl -Path $f
+                $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $userSid, [System.Security.AccessControl.FileSystemRights]::Modify,
+                    [System.Security.AccessControl.AccessControlType]::Allow)
+                $acl.AddAccessRule($rule)
+                Set-Acl -Path $f -AclObject $acl
+            }
+            # Reply directory: host writes JSON reply files into it, parent reads them.
+            $aclDir = Get-Acl -Path $paths.ReplyDir
+            $dirRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $userSid, [System.Security.AccessControl.FileSystemRights]::Modify,
+                [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow)
+            $aclDir.AddAccessRule($dirRule)
+            Set-Acl -Path $paths.ReplyDir -AclObject $aclDir
+        } catch {
+            Write-Log "Dialog host: failed to grant user ACL on session files - $($_.Exception.Message)" | Out-Null
+            # Continue anyway; the host may still work if C:\ProgramData\Temp is open to Users
+        }
 
         # Write host script to user's temp (it needs to run under user account)
         $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
@@ -1017,8 +1048,17 @@ try {
 
     $pump = New-Object System.Windows.Threading.DispatcherTimer
     $pump.Interval = [TimeSpan]::FromMilliseconds(250)
+    # v9.41: log heartbeat write failures (was silent catch). When this fires repeatedly the host
+    # is alive but the parent's Test-DialogHostAlive will trip on stale heartbeat - which is
+    # exactly the false-positive that produced the "two dialogs" symptom.
+    $script:hbWarnLogged = $false
     $pump.Add_Tick({
-        try { [System.IO.File]::WriteAllText($HeartbeatFile, (Get-Date -Format 'o')) } catch {}
+        try { [System.IO.File]::WriteAllText($HeartbeatFile, (Get-Date -Format 'o')) } catch {
+            if (-not $script:hbWarnLogged) {
+                Write-DH "Heartbeat write failed (suppressing further occurrences): $($_.Exception.Message)"
+                $script:hbWarnLogged = $true
+            }
+        }
         try {
             if (-not (Test-Path $CmdFile)) { return }
             $lines = [System.IO.File]::ReadAllLines($CmdFile, [System.Text.Encoding]::UTF8)
