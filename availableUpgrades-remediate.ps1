@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.31
- Tag: 31
+ Version: 9.32
+ Tag: 32
     
     Version History:
     1.0 - Initial version
@@ -96,6 +96,7 @@
     9.29 - FIX: Stripped em-dashes/en-dashes (U+2014, U+2013) from the script and saved with a UTF-8 BOM. Without a BOM, PowerShell 5.1 reads the file as Windows-1252 and the multi-byte UTF-8 sequence for an em-dash decodes to bytes 0xE2 0x80 0x94 - byte 0x94 is a right-quote in Windows-1252 which terminated string literals early and broke the parser when run via the iex bootstrapper (which writes the script to a .ps1 in temp without preserving UTF-8 metadata). All Unicode dashes replaced with ASCII hyphen-minus.
     9.30 - FIX: Get-CachedWhitelistJSON returned its log line concatenated with the cached body, so $whitelistJSON was "Using cached whitelist (age 0.6 min...) {actual JSON}" and ConvertFrom-Json failed with "Invalid JSON primitive". Root cause: Write-Log emits to the success stream under some conditions (Out-File internally); every other value-returning function in the script already pipes Write-Log to Out-Null for this reason - I missed it on the new function. All Write-Log calls inside Get-CachedWhitelistJSON now end with `| Out-Null`. Also added a defensive validator: cached and fetched bodies are checked to start with `{` or `[` before being used; corrupt cache files are auto-deleted so the next run re-fetches.
     9.31 - PERF: Dialogs now appear ~2-3 s faster. Three cold-start reductions in every scheduled-task-launched dialog (informational progress, mandatory update, deferral, completion notification, user prompt): (a) Added -NoProfile to the spawned powershell.exe so user profile customizations (e.g. Oh My Posh) no longer load before the WPF window renders - saved ~1-2 s on profiles with prompt frameworks. (b) Collapsed four separate Add-Type -AssemblyName calls into one combined call - PresentationFramework, PresentationCore, WindowsBase loaded together is noticeably faster than four sequential calls. (c) Dropped System.Windows.Forms from four of the five dialog scripts that only used it for [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; replaced with WPF's [System.Windows.SystemParameters]::WorkArea which is part of the already-loaded WindowsBase assembly - saves a whole extra assembly load (~500 ms). Net effect: the upgrade progress dialog now renders before winget finishes downloading instead of after, fixing the "dialogs appear after the work is done" symptom.
+    9.32 - FEATURE (foundation): Persistent dialog host - replaces the per-app dialog spawn pattern with a single long-lived WPF window that swaps content as remediation progresses. This commit adds only the foundation (command protocol, host script, lifecycle helpers); the existing Show-* / Invoke-System* functions are unchanged and still spawn per-dialog scheduled tasks. Next commit wires them through Send-DialogCommand with the legacy spawn kept as fallback. Protocol: JSON-lines appended to C:\ProgramData\Temp\availableUpgrades-dialog-<sessionId>.cmd, host pumps every 250 ms and replies via per-id files in the .replies dir; heartbeat + PID file make liveness verifiable in <10 s. Window has 5 panels (Progress, Transition, Completion, Mandatory, Deferral, Skip) toggled via Visibility; only one renders at a time. Cross-context handshake reuses the Schedule-UserContextRemediation pattern - SYSTEM starts the host and passes -DialogSessionId to user-context, which connects to the same files. Lifecycle is SYSTEM-owned: Stop-DialogHost is called after user-context handoff completes (or after SYSTEM's own loop if no handoff). User dismissal via X-button sets a session-scoped suppression flag; subsequent fire-and-forget commands (show-progress/status/transition/complete) are silently swallowed but blocking prompt-* commands (mandatory/deferral/skip) always force the window back into view because they require an explicit answer. Day-scoped SuppressInfoDialogs flag becomes obsolete in the new path (still honored by legacy fallback). Stale-task sweep and temp-file cleanup regex updated for the new DialogHost_ / availableUpgrades-dialog- patterns.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -270,6 +271,678 @@ CreateObject("Scripting.FileSystemObject").DeleteFile WScript.ScriptFullName, Tr
         return $null
     }
 }
+
+# ============================================================================
+# Persistent Dialog Host (v9.32)
+# ============================================================================
+# Replaces per-app dialog spawning with a single long-lived WPF window that
+# swaps content as remediation progresses. Communication is JSON-lines over
+# files in C:\ProgramData\Temp (same handshake pattern used by
+# Schedule-UserContextRemediation). The cross-context flow is:
+#   1. SYSTEM context: Start-DialogHost creates session files and launches the
+#      host script as a scheduled task in the interactive user's session.
+#   2. SYSTEM and user-context both call Send-DialogCommand, which appends to
+#      the session's .cmd file. The host pumps the file every 250 ms.
+#   3. User-context inherits the session via -DialogSessionId (set by
+#      Schedule-UserContextRemediation). If the host has died, callers fall
+#      back to legacy per-dialog spawn.
+#   4. SYSTEM owns lifecycle: it calls Stop-DialogHost after user-context
+#      handoff completes (or after its own loop if no handoff).
+
+$Script:DialogSession = $null      # populated by Start-DialogHost / Attach-DialogSession
+$Script:DialogCmdCounter = 0       # monotonic id for command correlation
+$Script:DialogLegacyFallback = $false  # set when host start/probe fails; suppresses retry
+
+function Get-DialogSessionPaths {
+    param([Parameter(Mandatory=$true)][string]$SessionId)
+    $base = Join-Path "C:\ProgramData\Temp" "availableUpgrades-dialog-$SessionId"
+    return @{
+        SessionId     = $SessionId
+        Base          = $base
+        CmdFile       = "$base.cmd"
+        CursorFile    = "$base.cursor"
+        ReplyDir      = "$base.replies"
+        HeartbeatFile = "$base.heartbeat"
+        PidFile       = "$base.pid"
+        LogFile       = "$base.log"
+        ScriptFile    = "$base.host.ps1"
+    }
+}
+
+function Test-DialogHostAlive {
+    <#
+    .SYNOPSIS Returns $true if the dialog host is processing commands.
+    Liveness = heartbeat younger than 10 s AND PID is alive.
+    #>
+    param($Session = $Script:DialogSession)
+    if (-not $Session) { return $false }
+    try {
+        if (-not (Test-Path $Session.HeartbeatFile)) { return $false }
+        $hbAge = (Get-Date) - (Get-Item $Session.HeartbeatFile).LastWriteTime
+        if ($hbAge.TotalSeconds -gt 10) { return $false }
+        if (-not (Test-Path $Session.PidFile)) { return $false }
+        $hostPid = [int]((Get-Content $Session.PidFile -Raw -ErrorAction Stop).Trim())
+        if (-not (Get-Process -Id $hostPid -ErrorAction SilentlyContinue)) { return $false }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Start-DialogHost {
+    <#
+    .SYNOPSIS Launches the persistent dialog host as a scheduled task in the
+    interactive user session. Populates $Script:DialogSession on success.
+    Returns $true on success, $false on failure (caller should fall back to
+    legacy per-dialog spawn).
+    #>
+    if ($Script:DialogSession -and (Test-DialogHostAlive)) {
+        Write-Log "Dialog host already running for session $($Script:DialogSession.SessionId)" | Out-Null
+        return $true
+    }
+    if ($Script:DialogLegacyFallback) { return $false }
+
+    try {
+        $userInfo = Get-InteractiveUser
+        if (-not $userInfo) {
+            Write-Log "Dialog host: no interactive user - falling back to legacy dialogs" | Out-Null
+            $Script:DialogLegacyFallback = $true
+            return $false
+        }
+
+        $sessionId = [Guid]::NewGuid().ToString('N').Substring(0, 12)
+        $paths = Get-DialogSessionPaths -SessionId $sessionId
+
+        if (-not (Test-Path "C:\ProgramData\Temp")) {
+            New-Item -Path "C:\ProgramData\Temp" -ItemType Directory -Force | Out-Null
+        }
+        New-Item -Path $paths.ReplyDir -ItemType Directory -Force | Out-Null
+        Set-Content -Path $paths.CmdFile -Value "" -Encoding UTF8 -Force
+        Set-Content -Path $paths.CursorFile -Value "0" -Encoding UTF8 -Force
+        Set-Content -Path $paths.HeartbeatFile -Value (Get-Date -Format 'o') -Encoding UTF8 -Force
+
+        # Write host script to user's temp (it needs to run under user account)
+        $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
+        if (-not (Test-Path $userTempPath)) { $userTempPath = "C:\ProgramData\Temp" }
+        $userScriptPath = Join-Path $userTempPath "availableUpgrades-dialog-$sessionId.host.ps1"
+        $Script:DialogHostScript | Set-Content -Path $userScriptPath -Encoding UTF8 -Force
+        $paths.ScriptFile = $userScriptPath
+
+        $hostArgs = "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$userScriptPath`" " +
+                    "-CmdFile `"$($paths.CmdFile)`" -CursorFile `"$($paths.CursorFile)`" " +
+                    "-ReplyDir `"$($paths.ReplyDir)`" -HeartbeatFile `"$($paths.HeartbeatFile)`" " +
+                    "-PidFile `"$($paths.PidFile)`" -LogFile `"$($paths.LogFile)`""
+        $launch = New-HiddenLaunchAction -PowerShellArguments $hostArgs -VbsDirectory $userTempPath -AllowUI
+        if (-not $launch) {
+            Write-Log "Dialog host: failed to create launch action - falling back" | Out-Null
+            $Script:DialogLegacyFallback = $true
+            return $false
+        }
+
+        $principal = $null
+        foreach ($userFormat in @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")) {
+            try {
+                $principal = New-ScheduledTaskPrincipal -UserId $userFormat -LogonType Interactive -RunLevel Limited
+                break
+            } catch { continue }
+        }
+        if (-not $principal) {
+            Write-Log "Dialog host: could not create task principal - falling back" | Out-Null
+            $Script:DialogLegacyFallback = $true
+            return $false
+        }
+
+        $taskName = "DialogHost_$sessionId"
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+        $task = New-ScheduledTask -Action $launch.Action -Principal $principal -Settings $settings -Description "Upgrade remediation dialog host"
+        Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+
+        $session = $paths.Clone()
+        $session.TaskName = $taskName
+        $session.VbsPath  = $launch.VbsPath
+        $Script:DialogSession = $session
+
+        # Wait up to 8 s for first heartbeat to confirm the host is up
+        $waitStart = Get-Date
+        while (((Get-Date) - $waitStart).TotalSeconds -lt 8) {
+            if (Test-DialogHostAlive) {
+                Write-Log "Dialog host ready (session $sessionId)" | Out-Null
+                return $true
+            }
+            Start-Sleep -Milliseconds 200
+        }
+
+        Write-Log "Dialog host did not heartbeat within 8 s - falling back to legacy dialogs" | Out-Null
+        $Script:DialogLegacyFallback = $true
+        Stop-DialogHost -Force | Out-Null
+        return $false
+
+    } catch {
+        Write-Log "Dialog host start failed: $($_.Exception.Message) - falling back" | Out-Null
+        $Script:DialogLegacyFallback = $true
+        return $false
+    }
+}
+
+function Connect-DialogSession {
+    <#
+    .SYNOPSIS User-context entry point: connect to an existing dialog session
+    started by SYSTEM. Returns $true if the host is alive and we can use it.
+    #>
+    param([Parameter(Mandatory=$true)][string]$SessionId)
+    try {
+        $paths = Get-DialogSessionPaths -SessionId $SessionId
+        $Script:DialogSession = $paths
+        if (Test-DialogHostAlive) {
+            Write-Log "Connected to dialog session $SessionId" | Out-Null
+            return $true
+        }
+        Write-Log "Dialog session $SessionId is not alive - falling back to legacy dialogs" | Out-Null
+        $Script:DialogSession = $null
+        $Script:DialogLegacyFallback = $true
+        return $false
+    } catch {
+        Write-Log "Connect-DialogSession failed: $($_.Exception.Message)" | Out-Null
+        $Script:DialogLegacyFallback = $true
+        return $false
+    }
+}
+
+function Send-DialogCommand {
+    <#
+    .SYNOPSIS Send a command to the dialog host. Fire-and-forget by default;
+    pass -Blocking to wait for the host's reply.
+    .OUTPUTS For -Blocking: the parsed reply object (or $null on timeout).
+             For fire-and-forget: $true if dispatched, $false if host dead.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Cmd,
+        [hashtable]$Payload = @{},
+        [switch]$Blocking,
+        [int]$TimeoutSeconds = 120
+    )
+    if (-not $Script:DialogSession) { return $false }
+    if (-not (Test-DialogHostAlive)) {
+        Write-Log "Send-DialogCommand: host not alive (cmd=$Cmd)" | Out-Null
+        $Script:DialogLegacyFallback = $true
+        return $false
+    }
+
+    $Script:DialogCmdCounter++
+    $cmdId = "c$($Script:DialogCmdCounter)"
+    $envelope = @{ id = $cmdId; cmd = $Cmd } + $Payload
+    $json = $envelope | ConvertTo-Json -Compress -Depth 5
+
+    # Append with retry to tolerate concurrent writers (SYSTEM + user-context)
+    $appended = $false
+    for ($i = 0; $i -lt 5 -and -not $appended; $i++) {
+        try {
+            [System.IO.File]::AppendAllText($Script:DialogSession.CmdFile, "$json`n", [System.Text.Encoding]::UTF8)
+            $appended = $true
+        } catch {
+            Start-Sleep -Milliseconds 50
+        }
+    }
+    if (-not $appended) {
+        Write-Log "Send-DialogCommand: failed to append (cmd=$Cmd)" | Out-Null
+        return $false
+    }
+
+    if (-not $Blocking) { return $true }
+
+    $replyFile = Join-Path $Script:DialogSession.ReplyDir "$cmdId.json"
+    $waitStart = Get-Date
+    while (((Get-Date) - $waitStart).TotalSeconds -lt $TimeoutSeconds) {
+        if (Test-Path $replyFile) {
+            try {
+                $reply = Get-Content $replyFile -Raw | ConvertFrom-Json
+                Remove-Item $replyFile -Force -ErrorAction SilentlyContinue
+                return $reply
+            } catch {
+                Start-Sleep -Milliseconds 100
+            }
+        }
+        if (-not (Test-DialogHostAlive)) {
+            Write-Log "Send-DialogCommand: host died while waiting for $cmdId" | Out-Null
+            return $null
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    Write-Log "Send-DialogCommand: timeout waiting for reply to $cmdId ($Cmd)" | Out-Null
+    return $null
+}
+
+function Stop-DialogHost {
+    param([switch]$Force)
+    if (-not $Script:DialogSession) { return }
+    $session = $Script:DialogSession
+    try {
+        if (-not $Force -and (Test-DialogHostAlive)) {
+            Send-DialogCommand -Cmd "shutdown" | Out-Null
+            $waitStart = Get-Date
+            while (((Get-Date) - $waitStart).TotalSeconds -lt 5) {
+                if (-not (Test-DialogHostAlive)) { break }
+                Start-Sleep -Milliseconds 200
+            }
+        }
+        if ($session.TaskName) {
+            Unregister-ScheduledTask -TaskName $session.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        foreach ($p in @($session.CmdFile, $session.CursorFile, $session.HeartbeatFile, $session.PidFile, $session.LogFile, $session.ScriptFile, $session.VbsPath)) {
+            if ($p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+        }
+        if ($session.ReplyDir -and (Test-Path $session.ReplyDir)) {
+            Remove-Item $session.ReplyDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Write-Log "Dialog host stopped (session $($session.SessionId))" | Out-Null
+    } catch {
+        Write-Log "Stop-DialogHost cleanup error: $($_.Exception.Message)" | Out-Null
+    } finally {
+        $Script:DialogSession = $null
+    }
+}
+
+# ----------------------------------------------------------------------------
+# DialogHost inline script - written to disk and run as scheduled task. Uses
+# single-quoted here-string so $-variables stay literal until the host runs.
+# ----------------------------------------------------------------------------
+$Script:DialogHostScript = @'
+param(
+    [Parameter(Mandatory=$true)][string]$CmdFile,
+    [Parameter(Mandatory=$true)][string]$CursorFile,
+    [Parameter(Mandatory=$true)][string]$ReplyDir,
+    [Parameter(Mandatory=$true)][string]$HeartbeatFile,
+    [Parameter(Mandatory=$true)][string]$PidFile,
+    [Parameter(Mandatory=$true)][string]$LogFile
+)
+
+[System.IO.File]::WriteAllText($PidFile, "$PID")
+function Write-DH($msg) {
+    try {
+        $line = "$(Get-Date -Format 'HH:mm:ss.fff') $msg"
+        [System.IO.File]::AppendAllText($LogFile, "$line`r`n", [System.Text.Encoding]::UTF8)
+    } catch {}
+}
+Write-DH "DialogHost started, PID=$PID"
+
+try {
+    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
+    $workArea = [System.Windows.SystemParameters]::WorkArea
+
+    # Theme detection (light vs dark)
+    $isDark = $true
+    try {
+        $themeKey = Get-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -ErrorAction Stop
+        $isDark = $themeKey.AppsUseLightTheme -eq 0
+    } catch {}
+    if ($isDark) {
+        $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $textColor = "#FFFFFFFF"
+        $subColor = "#FFCCCCCC"; $shadowOpacity = "0.6"; $closeBtnFg = "#FF888888"
+    } else {
+        $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $textColor = "#FF1B1B1B"
+        $subColor = "#FF555555"; $shadowOpacity = "0.25"; $closeBtnFg = "#FF999999"
+    }
+
+    $xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Software Updates" Width="440" MinHeight="120" SizeToContent="Height"
+        WindowStartupLocation="Manual" ResizeMode="NoResize" WindowStyle="None"
+        AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
+  <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
+    <Border.Effect>
+      <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/>
+    </Border.Effect>
+    <Grid Margin="0">
+      <!-- Close button (visible on non-blocking panels only) -->
+      <Button Name="CloseButton" Content="X" Width="22" Height="22"
+              HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0"
+              Background="Transparent" BorderThickness="0" Foreground="$closeBtnFg"
+              FontSize="11" FontWeight="Bold" Cursor="Hand" Panel.ZIndex="10"/>
+
+      <!-- ProgressPanel: ongoing winget upgrade for one app -->
+      <Grid Name="ProgressPanel" Margin="20,16,20,16" Visibility="Collapsed">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <TextBlock Grid.Row="0" Name="ProgressTitle" Text="Updating..." Foreground="$textColor" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,2"/>
+        <TextBlock Grid.Row="1" Name="ProgressVersion" Text="" Foreground="$subColor" FontSize="11" Margin="0,0,0,6"/>
+        <ProgressBar Grid.Row="2" Name="ProgressBar" IsIndeterminate="True" Height="3" Foreground="#FF0078D4"/>
+        <TextBlock Grid.Row="2" Name="ProgressStatus" Text="Preparing..." Foreground="$subColor" FontSize="11" HorizontalAlignment="Center" Margin="0,12,0,0"/>
+      </Grid>
+
+      <!-- TransitionPanel: brief "Done X -> Starting Y" between apps -->
+      <Grid Name="TransitionPanel" Margin="20,16,20,16" Visibility="Collapsed">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <TextBlock Grid.Row="0" Name="TransitionFrom" Text="" Foreground="$textColor" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,4"/>
+        <TextBlock Grid.Row="1" Name="TransitionTo" Text="" Foreground="$subColor" FontSize="12"/>
+      </Grid>
+
+      <!-- CompletionPanel: final "Update complete" or "Could not be completed" -->
+      <Grid Name="CompletionPanel" Margin="20,16,20,16" Visibility="Collapsed">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="32"/><ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <Ellipse Grid.Column="0" Name="CompletionIcon" Width="24" Height="24" Fill="#FF107C10" VerticalAlignment="Top" Margin="0,2,0,0"/>
+        <TextBlock Grid.Column="0" Name="CompletionGlyph" Text="OK" Foreground="White" FontSize="10" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,7,0,0"/>
+        <StackPanel Grid.Column="1" Margin="12,0,0,0">
+          <TextBlock Name="CompletionTitle" Text="Update complete" Foreground="$textColor" FontSize="13" FontWeight="SemiBold"/>
+          <TextBlock Name="CompletionBody"  Text=""                Foreground="$subColor"  FontSize="11" Margin="0,2,0,0" TextWrapping="Wrap"/>
+        </StackPanel>
+      </Grid>
+
+      <!-- MandatoryPanel: forced update prompt with Upgrade button -->
+      <Grid Name="MandatoryPanel" Margin="16,12,16,12" Visibility="Collapsed">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="32"/><ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <Ellipse Grid.Column="0" Grid.RowSpan="3" Width="24" Height="24" Fill="#FFFF6B00" VerticalAlignment="Top" Margin="0,2,0,0"/>
+        <TextBlock Grid.Column="0" Grid.RowSpan="3" Text="!" Foreground="White" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,4,0,0"/>
+        <TextBlock Grid.Column="1" Grid.Row="0" Name="MandatoryTitle"   Text="" Foreground="$textColor" FontSize="14" FontWeight="SemiBold" Margin="12,0,0,2" TextWrapping="Wrap"/>
+        <TextBlock Grid.Column="1" Grid.Row="1" Name="MandatoryVersion" Text="" Foreground="$subColor"  FontSize="12" Margin="12,0,0,8" TextWrapping="Wrap"/>
+        <TextBlock Grid.Column="1" Grid.Row="2" Name="MandatoryBody"    Text="" Foreground="$subColor"  FontSize="12" Margin="12,0,0,8" TextWrapping="Wrap"/>
+        <StackPanel Grid.Column="1" Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="12,0,0,0">
+          <Button Name="MandatoryButton" Content="Upgrade" Width="100" Height="28" Background="#FF0078D4" Foreground="White" IsDefault="true"/>
+        </StackPanel>
+      </Grid>
+
+      <!-- DeferralPanel: Defer / Update Now -->
+      <Grid Name="DeferralPanel" Margin="16,12,16,12" Visibility="Collapsed">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <TextBlock Grid.Row="0" Name="DeferralTitle"   Text="" Foreground="$textColor" FontSize="14" FontWeight="SemiBold" Margin="0,0,0,2" TextWrapping="Wrap"/>
+        <TextBlock Grid.Row="1" Name="DeferralBody"    Text="" Foreground="$subColor"  FontSize="12" Margin="0,0,0,8" TextWrapping="Wrap"/>
+        <TextBlock Grid.Row="2" Name="DeferralCounter" Text="" Foreground="$subColor"  FontSize="11" Margin="0,0,0,8"/>
+        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
+          <Button Name="DeferralDeferButton"  Content="Defer"      Width="100" Height="28" Margin="0,0,8,0"/>
+          <Button Name="DeferralUpdateButton" Content="Update Now" Width="100" Height="28" Background="#FF0078D4" Foreground="White" IsDefault="true"/>
+        </StackPanel>
+      </Grid>
+
+      <!-- SkipPanel: "Skip this version after N failures?" -->
+      <Grid Name="SkipPanel" Margin="16,12,16,12" Visibility="Collapsed">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <TextBlock Grid.Row="0" Name="SkipTitle" Text="" Foreground="$textColor" FontSize="14" FontWeight="SemiBold" Margin="0,0,0,4" TextWrapping="Wrap"/>
+        <TextBlock Grid.Row="1" Name="SkipBody"  Text="" Foreground="$subColor"  FontSize="12" Margin="0,0,0,8" TextWrapping="Wrap"/>
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right">
+          <Button Name="SkipRetryButton" Content="Retry" Width="100" Height="28" Margin="0,0,8,0"/>
+          <Button Name="SkipSkipButton"  Content="Skip"  Width="100" Height="28" Background="#FF0078D4" Foreground="White" IsDefault="true"/>
+        </StackPanel>
+      </Grid>
+    </Grid>
+  </Border>
+</Window>
+"@
+
+    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+    $window = [Windows.Markup.XamlReader]::Load($reader)
+    $window.Left = $workArea.Right  - 460
+    $window.Top  = $workArea.Bottom - 200
+    $window.Hide() | Out-Null
+
+    # Element refs
+    $panels = @{
+        Progress   = $window.FindName("ProgressPanel")
+        Transition = $window.FindName("TransitionPanel")
+        Completion = $window.FindName("CompletionPanel")
+        Mandatory  = $window.FindName("MandatoryPanel")
+        Deferral   = $window.FindName("DeferralPanel")
+        Skip       = $window.FindName("SkipPanel")
+    }
+    $closeBtn = $window.FindName("CloseButton")
+
+    # State
+    $script:suppressed = $false       # session-scoped after user clicks X
+    $script:visible    = $false
+    $script:cursor     = 0
+    $script:blocking   = $null        # @{ Id, Cmd, TimeoutTimer, CountdownTimer, TimeRemaining, DefaultResponse, ButtonOriginal }
+
+    function Show-Panel($name) {
+        foreach ($k in $panels.Keys) {
+            $panels[$k].Visibility = if ($k -eq $name) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+        }
+        # Hide close button on blocking panels (Mandatory must be answered; Deferral/Skip have explicit buttons)
+        $closeBtn.Visibility = if ($name -in @("Mandatory","Deferral","Skip")) { [System.Windows.Visibility]::Collapsed } else { [System.Windows.Visibility]::Visible }
+    }
+    function Ensure-Visible {
+        if (-not $script:visible) {
+            $window.Show()
+            $window.Activate() | Out-Null
+            $script:visible = $true
+        }
+    }
+    function Ensure-Hidden {
+        if ($script:visible) {
+            $window.Hide()
+            $script:visible = $false
+        }
+    }
+    function Write-Reply($id, $payload) {
+        try {
+            $obj = @{ id = $id } + $payload
+            $json = $obj | ConvertTo-Json -Compress -Depth 5
+            $replyPath = Join-Path $ReplyDir "$id.json"
+            [System.IO.File]::WriteAllText($replyPath, $json, [System.Text.Encoding]::UTF8)
+        } catch { Write-DH "Write-Reply failed: $($_.Exception.Message)" }
+    }
+    function End-Blocking($response) {
+        if (-not $script:blocking) { return }
+        $b = $script:blocking
+        if ($b.TimeoutTimer)   { $b.TimeoutTimer.Stop() }
+        if ($b.CountdownTimer) { $b.CountdownTimer.Stop() }
+        Write-Reply $b.Id @{ response = $response }
+        Write-DH "Blocking $($b.Cmd) -> $response"
+        $script:blocking = $null
+    }
+
+    # Close button: suppress for session, hide window
+    $closeBtn.Add_Click({
+        Write-DH "Close clicked - suppressing informational dialogs for session"
+        $script:suppressed = $true
+        Ensure-Hidden
+    })
+
+    # Mandatory button -> "upgrade"
+    $window.FindName("MandatoryButton").Add_Click({ End-Blocking "upgrade"; Ensure-Hidden })
+
+    # Deferral buttons
+    $window.FindName("DeferralDeferButton").Add_Click({ End-Blocking "defer"; Ensure-Hidden })
+    $window.FindName("DeferralUpdateButton").Add_Click({ End-Blocking "update"; Ensure-Hidden })
+
+    # Skip buttons
+    $window.FindName("SkipRetryButton").Add_Click({ End-Blocking "retry"; Ensure-Hidden })
+    $window.FindName("SkipSkipButton").Add_Click({  End-Blocking "skip";  Ensure-Hidden })
+
+    # Window-close: if blocking, treat as timeout (default response)
+    $window.Add_Closing({
+        if ($script:blocking) {
+            End-Blocking $script:blocking.DefaultResponse
+        }
+    })
+
+    # ------------------------------------------------------------------
+    # Command pump - reads new lines from $CmdFile every 250 ms
+    # ------------------------------------------------------------------
+    function Process-Command($obj) {
+        $id  = $obj.id
+        $cmd = $obj.cmd
+        switch ($cmd) {
+            "show-progress" {
+                if ($script:suppressed) { return }
+                $window.FindName("ProgressTitle").Text = "Updating $($obj.app)..."
+                $vText = ""
+                if ($obj.fromVersion -and $obj.toVersion) { $vText = "$($obj.fromVersion) -> $($obj.toVersion)" }
+                elseif ($obj.toVersion) { $vText = "Version $($obj.toVersion)" }
+                $window.FindName("ProgressVersion").Text = $vText
+                $window.FindName("ProgressStatus").Text = "Preparing..."
+                $bar = $window.FindName("ProgressBar"); $bar.IsIndeterminate = $true; $bar.Value = 0
+                Show-Panel "Progress"
+                Ensure-Visible
+            }
+            "status" {
+                if ($script:suppressed) { return }
+                $window.FindName("ProgressStatus").Text = [string]$obj.text
+            }
+            "transition" {
+                if ($script:suppressed) { return }
+                $outcome = if ($obj.outcome -eq "ok") { "updated" } elseif ($obj.outcome -eq "failed") { "failed" } elseif ($obj.outcome -eq "skipped") { "skipped" } else { "done" }
+                $window.FindName("TransitionFrom").Text = "$($obj.fromApp) $outcome"
+                $window.FindName("TransitionTo").Text   = if ($obj.toApp) { "Starting $($obj.toApp)..." } else { "" }
+                Show-Panel "Transition"
+                Ensure-Visible
+                # Auto-advance: nothing to do - the next show-progress command will swap content
+            }
+            "complete" {
+                if ($script:suppressed) { return }
+                $ok = ($obj.success -eq $true)
+                $window.FindName("CompletionIcon").Fill = if ($ok) { [System.Windows.Media.BrushConverter]::new().ConvertFrom("#FF107C10") } else { [System.Windows.Media.BrushConverter]::new().ConvertFrom("#FFD13438") }
+                $window.FindName("CompletionGlyph").Text = if ($ok) { "OK" } else { "X" }
+                $window.FindName("CompletionTitle").Text = if ($obj.title) { [string]$obj.title } elseif ($ok) { "Update complete" } else { "Update could not be completed" }
+                $window.FindName("CompletionBody").Text  = if ($obj.body) { [string]$obj.body } else { "" }
+                Show-Panel "Completion"
+                Ensure-Visible
+                # Auto-hide after 3 s
+                $hideTimer = New-Object System.Windows.Threading.DispatcherTimer
+                $hideTimer.Interval = [TimeSpan]::FromSeconds(3)
+                $hideTimer.Add_Tick({ $hideTimer.Stop(); Ensure-Hidden })
+                $hideTimer.Start()
+            }
+            "prompt-mandatory" {
+                $timeout = if ($obj.timeoutSec) { [int]$obj.timeoutSec } else { 60 }
+                $window.FindName("MandatoryTitle").Text = if ($obj.title)   { [string]$obj.title }   else { "Required Update: $($obj.app)" }
+                $window.FindName("MandatoryVersion").Text = if ($obj.versionInfo) { [string]$obj.versionInfo } else { "" }
+                $window.FindName("MandatoryBody").Text  = if ($obj.body)    { [string]$obj.body }    else { "" }
+                $btn = $window.FindName("MandatoryButton"); $btn.Content = "Upgrade ($timeout)"
+                Show-Panel "Mandatory"
+                Ensure-Visible
+                # Countdown
+                $script:blocking = @{
+                    Id = $id; Cmd = $cmd; DefaultResponse = "timeout"; TimeRemaining = $timeout; ButtonOriginal = "Upgrade"
+                }
+                $countdown = New-Object System.Windows.Threading.DispatcherTimer
+                $countdown.Interval = [TimeSpan]::FromSeconds(1)
+                $countdown.Add_Tick({
+                    if (-not $script:blocking) { $countdown.Stop(); return }
+                    $script:blocking.TimeRemaining--
+                    $btn.Content = "$($script:blocking.ButtonOriginal) ($($script:blocking.TimeRemaining))"
+                    if ($script:blocking.TimeRemaining -le 0) { $countdown.Stop() }
+                })
+                $countdown.Start()
+                $timeoutTimer = New-Object System.Windows.Threading.DispatcherTimer
+                $timeoutTimer.Interval = [TimeSpan]::FromSeconds($timeout)
+                $timeoutTimer.Add_Tick({ $timeoutTimer.Stop(); End-Blocking "timeout"; Ensure-Hidden })
+                $timeoutTimer.Start()
+                $script:blocking.TimeoutTimer = $timeoutTimer
+                $script:blocking.CountdownTimer = $countdown
+            }
+            "prompt-deferral" {
+                $timeout = if ($obj.timeoutSec) { [int]$obj.timeoutSec } else { 60 }
+                $window.FindName("DeferralTitle").Text = if ($obj.title) { [string]$obj.title } else { "Update available: $($obj.app)" }
+                $window.FindName("DeferralBody").Text  = if ($obj.body)  { [string]$obj.body }  else { "" }
+                $window.FindName("DeferralCounter").Text = if ($obj.daysLeft -ne $null) { "You can defer for up to $($obj.daysLeft) more days." } else { "" }
+                $deferBtn = $window.FindName("DeferralDeferButton")
+                $deferBtn.IsEnabled = ($obj.canDefer -eq $true)
+                $updateBtn = $window.FindName("DeferralUpdateButton")
+                $updateBtn.Content = "Update Now ($timeout)"
+                Show-Panel "Deferral"
+                Ensure-Visible
+                $script:blocking = @{
+                    Id = $id; Cmd = $cmd; DefaultResponse = "timeout"; TimeRemaining = $timeout; ButtonOriginal = "Update Now"
+                }
+                $countdown = New-Object System.Windows.Threading.DispatcherTimer
+                $countdown.Interval = [TimeSpan]::FromSeconds(1)
+                $countdown.Add_Tick({
+                    if (-not $script:blocking) { $countdown.Stop(); return }
+                    $script:blocking.TimeRemaining--
+                    $updateBtn.Content = "$($script:blocking.ButtonOriginal) ($($script:blocking.TimeRemaining))"
+                    if ($script:blocking.TimeRemaining -le 0) { $countdown.Stop() }
+                })
+                $countdown.Start()
+                $timeoutTimer = New-Object System.Windows.Threading.DispatcherTimer
+                $timeoutTimer.Interval = [TimeSpan]::FromSeconds($timeout)
+                $timeoutTimer.Add_Tick({ $timeoutTimer.Stop(); End-Blocking "timeout"; Ensure-Hidden })
+                $timeoutTimer.Start()
+                $script:blocking.TimeoutTimer = $timeoutTimer
+                $script:blocking.CountdownTimer = $countdown
+            }
+            "prompt-skip" {
+                $timeout = if ($obj.timeoutSec) { [int]$obj.timeoutSec } else { 60 }
+                $window.FindName("SkipTitle").Text = "$($obj.app) has failed to update $($obj.failures) times"
+                $window.FindName("SkipBody").Text  = if ($obj.body) { [string]$obj.body } else { "Skip this version, or retry next cycle?" }
+                Show-Panel "Skip"
+                Ensure-Visible
+                $script:blocking = @{
+                    Id = $id; Cmd = $cmd; DefaultResponse = "timeout"; TimeRemaining = $timeout; ButtonOriginal = ""
+                }
+                $timeoutTimer = New-Object System.Windows.Threading.DispatcherTimer
+                $timeoutTimer.Interval = [TimeSpan]::FromSeconds($timeout)
+                $timeoutTimer.Add_Tick({ $timeoutTimer.Stop(); End-Blocking "timeout"; Ensure-Hidden })
+                $timeoutTimer.Start()
+                $script:blocking.TimeoutTimer = $timeoutTimer
+            }
+            "hide" {
+                Ensure-Hidden
+            }
+            "shutdown" {
+                Write-DH "Shutdown received"
+                if ($script:blocking) { End-Blocking $script:blocking.DefaultResponse }
+                $window.Close()
+            }
+            default {
+                Write-DH "Unknown cmd: $cmd"
+            }
+        }
+    }
+
+    $pump = New-Object System.Windows.Threading.DispatcherTimer
+    $pump.Interval = [TimeSpan]::FromMilliseconds(250)
+    $pump.Add_Tick({
+        try { [System.IO.File]::WriteAllText($HeartbeatFile, (Get-Date -Format 'o')) } catch {}
+        try {
+            if (-not (Test-Path $CmdFile)) { return }
+            $lines = [System.IO.File]::ReadAllLines($CmdFile, [System.Text.Encoding]::UTF8)
+            if ($lines.Length -le $script:cursor) { return }
+            for ($i = $script:cursor; $i -lt $lines.Length; $i++) {
+                $line = $lines[$i].Trim()
+                if (-not $line) { continue }
+                try {
+                    $obj = $line | ConvertFrom-Json
+                    Process-Command $obj
+                } catch {
+                    Write-DH "Bad command line $($i+1): $($_.Exception.Message) | $line"
+                }
+            }
+            $script:cursor = $lines.Length
+            [System.IO.File]::WriteAllText($CursorFile, "$($script:cursor)")
+        } catch {
+            Write-DH "Pump error: $($_.Exception.Message)"
+        }
+    })
+    $pump.Start()
+
+    # Use ShowDialog of an invisible "anchor" window to run a message loop
+    # The real $window starts hidden and toggles visibility via Show()/Hide().
+    # We need a Dispatcher.Run() to keep the message pump alive even when
+    # the window is hidden, so use Application + DoEvents pattern instead.
+    $app = New-Object System.Windows.Application
+    $app.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
+    $window.Add_Closed({ $app.Shutdown() })
+    $app.Run() | Out-Null
+
+} catch {
+    Write-DH "FATAL: $($_.Exception.Message)"
+}
+Write-DH "DialogHost exiting"
+'@
 
 # WPF System User Prompt Functions - Modern replacement for legacy toast notification system
 
@@ -5600,7 +6273,7 @@ function Remove-OldTempFiles {
 
     # Match all file patterns this script creates (temp files, scripts, VBS launchers)
     # Using regex instead of -Filter because Windows filter matching is unreliable with multiple dots (e.g. .heartbeat.error)
-    $nameRegex = '^(UserRemediation_\d+\.|UserRemediationHeartbeat_|availableUpgrades-remediate_\d+\.ps1|MandatoryPrompt_.*_(Response|Progress)|Show-MandatoryPrompt_|DeferralPrompt_.*_Response|Show-DeferralPrompt_|UserPrompt_.*_Response|Show-UserPrompt_|UpgradeProgress_.*_(Signal|Status)|Show-UpgradeProgress_|CompletionNotification_|Show-CompletionNotification_|SkipPrompt_.*_Response|Show-SkipPrompt_|UserContext_Debug|UserContext_Heartbeat_Error_|HiddenLaunch_\d+\.vbs$)'
+    $nameRegex = '^(UserRemediation_\d+\.|UserRemediationHeartbeat_|availableUpgrades-remediate_\d+\.ps1|availableUpgrades-dialog-|MandatoryPrompt_.*_(Response|Progress)|Show-MandatoryPrompt_|DeferralPrompt_.*_Response|Show-DeferralPrompt_|UserPrompt_.*_Response|Show-UserPrompt_|UpgradeProgress_.*_(Signal|Status)|Show-UpgradeProgress_|CompletionNotification_|Show-CompletionNotification_|SkipPrompt_.*_Response|Show-SkipPrompt_|UserContext_Debug|UserContext_Heartbeat_Error_|HiddenLaunch_\d+\.vbs$)'
 
     # Scan C:\ProgramData\Temp
     $tempPath = "C:\ProgramData\Temp"
@@ -5656,7 +6329,8 @@ function Remove-StaleScheduledTasks {
         "MandatoryPrompt_",
         "DeferralPrompt_",
         "SkipPrompt_",
-        "UserRemediation_"
+        "UserRemediation_",
+        "DialogHost_"
     )
 
     try {
