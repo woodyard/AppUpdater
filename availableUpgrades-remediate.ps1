@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.42
- Tag: 42
+ Version: 9.43
+ Tag: 43
     
     Version History:
     1.0 - Initial version
@@ -105,6 +105,7 @@
     9.38 - FIX: When the per-app loop ended without processing any apps (e.g. the only app in the task file was actively deferred and got skipped), the script still sent a `complete` command to the dialog host. The host briefly rendered "Updates complete - 0 apps processed" with its 3-second auto-hide, but Stop-DialogHost fired immediately after and force-killed the host process within ~1 s, producing a visible sub-second flash of the completion panel even though the run was a no-op. Now the final `complete` command is gated on $count -gt 0 so a no-op run leaves the host hidden through teardown.
     9.39 - FIX: WingetUpgradeManager registry state (Deferrals, Failures, ReleaseCache) was being read/written via PSDrive paths like HKLM:\SOFTWARE\WingetUpgradeManager\..., which the Windows WoW64 redirector silently rewrites to HKLM:\SOFTWARE\WOW6432Node\... when the host process is 32-bit. Intune Remediations default to a 32-bit PowerShell host, so all script writes went to WOW6432Node; anything reading from a 64-bit context (manual PowerShell prompt, ad-hoc tooling) saw an empty/stale view. A user with an active Notepad++ deferral was invisible to a 64-bit Get-ChildItem on the non-WOW path while clearly visible at the WOW6432Node path. Fix: introduced $Script:WumRegRoot pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager and routed all 12 call sites through it (later renamed to $Script:AppRegRoot in v9.40). Both 32-bit and 64-bit PowerShell hosts now hit the same physical hive. Chose WOW6432Node-pinned (not 64-bit-pinned via .NET OpenBaseKey) because existing data is already at WOW6432Node from prior 32-bit Intune runs, so no migration is required; the trade-off is that orphaned entries written to the native HKLM:\SOFTWARE\WingetUpgradeManager by old 64-bit runs become invisible to the script (acceptable: those entries were already stale or expired).
     9.40 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot to match. No automatic migration of state from the old WingetUpgradeManager path - existing deferrals, failures, and release cache entries become orphaned. On the next run the script sees an empty state, so users will be re-prompted for any apps with pending updates instead of having their previously-set deferrals honored. Manual cleanup of the orphaned old key is up to the operator: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager' -Recurse -Force.
+    9.43 - FIX: On a freshly-set-up Windows machine the dialog host failed to start - parent logged "Dialog host did not heartbeat within 8 s" and fell back to legacy spawn, AND no preserved host log was produced. The host process actually started but died before its first Write-DH call. Root cause: when C:\ProgramData\Temp was freshly created by SYSTEM (Start-DialogHost's auto-create branch), it inherited C:\ProgramData's default ACL which grants Users only Read+Execute - not Create-File. v9.41's ACL fix granted the user Modify on the FILES that SYSTEM had pre-created (CmdFile/CursorFile/HeartbeatFile), but the host's very first action is to WriteAllText its OWN files (PidFile, LogFile, replies/*.json), and the user couldn't CREATE new files in the parent directory. The host's WriteAllText on PidFile threw Access Denied, the process died, no Write-DH ever fired, and the parent waited 8 s on a heartbeat that would never come. Two fixes: (a) Session files now live inside a per-session SUBDIRECTORY (C:\ProgramData\Temp\availableUpgrades-dialog-<id>\{cmd, cursor, heartbeat, pid, host.log, replies\}); SYSTEM creates that directory and grants the user Modify with ContainerInherit+ObjectInherit, so every file the host wants to create inside it just works. (b) Heartbeat wait window bumped from 8 s to 15 s to cover slow first-run WPF cold start. Stop-DialogHost moves the log out to a flat sibling location before removing the per-session directory, so log preservation still works.
     9.42 - FIX: v9.39's "pin registry path to WOW6432Node" approach was based on the wrong WoW64 semantics. PSDrive registry cmdlets (Get-ItemProperty, Set-ItemProperty, etc.) go through the WoW64 redirector, which from a 32-bit PowerShell host rewrites HKLM:\SOFTWARE\X to HKLM:\SOFTWARE\WOW6432Node\X *unconditionally* - it does not notice that WOW6432Node is already in the requested path. So v9.39's writes to HKLM:\SOFTWARE\WOW6432Node\AppUpdater\Deferrals\... actually landed at HKLM:\SOFTWARE\WOW6432Node\WOW6432Node\AppUpdater\Deferrals\... (confirmed in field: Notepad++.Notepad++ deferral with the v9.41 ACL fix was discovered at the double-WOW path). Proper fix: introduced Open-AppRegKey / Test-AppRegKey / Get-AppRegValue / Get-AppRegProperties / Set-AppRegValue / Remove-AppRegValue / Remove-AppRegKey / Get-AppRegChildKeyNames helpers that use [Microsoft.Win32.RegistryKey]::OpenBaseKey(LocalMachine, Registry64), explicitly requesting the 64-bit view and bypassing the redirector entirely. All 12 PSDrive call sites in remediate.ps1 (Initialize-DeferralRegistry, Get-AppReleaseDate, Get-DeferralStatus, Set-WhitelistedAppDeferral, the deferral/cache cleanup, and the four Get/Set/Clear-VersionFailure functions) routed through the helpers. Data now lives at HKLM:\SOFTWARE\AppUpdater (visible from any 32-bit OR 64-bit observer at the natural path). Existing state at HKLM:\SOFTWARE\WOW6432Node\WOW6432Node\AppUpdater is orphaned with no automatic migration. Operator cleanup: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WOW6432Node\AppUpdater' -Recurse -Force.
     9.41 - FIX: Real root cause of "host died mid-prompt" and the "two dialogs on screen" symptom. SYSTEM creates the session IPC files (CmdFile, CursorFile, HeartbeatFile) in C:\ProgramData\Temp, where the default ACL gives CREATOR OWNER (i.e. SYSTEM) full control and Users only read. The user-context host process can therefore READ the cmd file but its WriteAllText on CursorFile and HeartbeatFile silently fails with "Access denied". The previous code swallowed those failures in a no-op catch, so the heartbeat file timestamp never refreshed - and ~10 s after host startup, the parent's Test-DialogHostAlive declared the host dead based on stale heartbeat while the host was alive and rendering a dialog. Send-DialogCommand then returned $null, the v9.36 wrapper fell through to the legacy spawn, and the user saw the legacy dialog appear on top of the still-up host dialog. Two fixes: (a) Start-DialogHost now explicitly grants the interactive user Modify rights on CmdFile/CursorFile/HeartbeatFile (via SetAccessRule) and on the ReplyDir (via inherited Modify) immediately after creating them, so the host can actually write its own heartbeat. (b) The pump's heartbeat-write catch now logs the first failure via Write-DH (suppresses repeats) instead of silently swallowing, so any future ACL/IO failure shows up immediately in the host log instead of producing a mysterious false-positive 10 s later. With these in place, the dialog host should remain provably alive throughout a 120 s prompt - no fallback spawn, one dialog on screen, then teardown when the user clicks Defer or Update Now.
 
@@ -305,17 +306,23 @@ $Script:DialogCmdCounter = 0       # monotonic id for command correlation
 $Script:DialogLegacyFallback = $false  # set when host start/probe fails; suppresses retry
 
 function Get-DialogSessionPaths {
+    # v9.43: session files now live INSIDE a per-session subdirectory rather than at sibling
+    # paths sharing a prefix. SYSTEM creates the directory and grants the interactive user
+    # Modify with inheritance (see Start-DialogHost), so the user-context host can create
+    # PidFile / LogFile / replies/* itself without hitting "Access denied" - the previous flat
+    # layout depended on the user being able to create files directly under C:\ProgramData\Temp,
+    # which a freshly-created C:\ProgramData\Temp does not allow.
     param([Parameter(Mandatory=$true)][string]$SessionId)
     $base = Join-Path "C:\ProgramData\Temp" "availableUpgrades-dialog-$SessionId"
     return @{
         SessionId     = $SessionId
         Base          = $base
-        CmdFile       = "$base.cmd"
-        CursorFile    = "$base.cursor"
-        ReplyDir      = "$base.replies"
-        HeartbeatFile = "$base.heartbeat"
-        PidFile       = "$base.pid"
-        LogFile       = "$base.log"
+        CmdFile       = Join-Path $base 'cmd'
+        CursorFile    = Join-Path $base 'cursor'
+        ReplyDir      = Join-Path $base 'replies'
+        HeartbeatFile = Join-Path $base 'heartbeat'
+        PidFile       = Join-Path $base 'pid'
+        LogFile       = Join-Path $base 'host.log'
         ScriptFile    = "$base.host.ps1"
     }
 }
@@ -367,40 +374,32 @@ function Start-DialogHost {
         if (-not (Test-Path "C:\ProgramData\Temp")) {
             New-Item -Path "C:\ProgramData\Temp" -ItemType Directory -Force | Out-Null
         }
-        New-Item -Path $paths.ReplyDir -ItemType Directory -Force | Out-Null
-        Set-Content -Path $paths.CmdFile -Value "" -Encoding UTF8 -Force
-        Set-Content -Path $paths.CursorFile -Value "0" -Encoding UTF8 -Force
-        Set-Content -Path $paths.HeartbeatFile -Value (Get-Date -Format 'o') -Encoding UTF8 -Force
-
-        # v9.41: grant the interactive user Modify on every session IPC file. SYSTEM creates them
-        # so default ACL is "CREATOR OWNER = SYSTEM" - the user-context host process can read
-        # them but its WriteAllText on CursorFile/HeartbeatFile silently fails with "Access denied",
-        # the heartbeat file timestamp never refreshes, and after ~10 s Test-DialogHostAlive
-        # falsely declares the host dead while it's actually alive and rendering a dialog. The
-        # parent then spawns the legacy fallback dialog on top - the "two dialogs" symptom.
+        # v9.43: create per-session subdirectory and grant the interactive user Modify with
+        # ContainerInherit+ObjectInherit. Any file the user-context host creates inside it
+        # (PidFile, LogFile, replies/*.json) inherits Modify automatically. Previous flat layout
+        # depended on the user being able to create files directly in C:\ProgramData\Temp,
+        # which a freshly-SYSTEM-created C:\ProgramData\Temp does not allow - host died before
+        # its first Write-DH call (no log file produced) and the parent's 8 s wait timed out.
+        New-Item -Path $paths.Base -ItemType Directory -Force | Out-Null
         try {
-            $userSid = New-Object System.Security.Principal.SecurityIdentifier($userInfo.SID)
-            foreach ($f in @($paths.CmdFile, $paths.CursorFile, $paths.HeartbeatFile)) {
-                $acl = Get-Acl -Path $f
-                $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                    $userSid, [System.Security.AccessControl.FileSystemRights]::Modify,
-                    [System.Security.AccessControl.AccessControlType]::Allow)
-                $acl.AddAccessRule($rule)
-                Set-Acl -Path $f -AclObject $acl
-            }
-            # Reply directory: host writes JSON reply files into it, parent reads them.
-            $aclDir = Get-Acl -Path $paths.ReplyDir
-            $dirRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $userSid  = New-Object System.Security.Principal.SecurityIdentifier($userInfo.SID)
+            $aclDir   = Get-Acl -Path $paths.Base
+            $dirRule  = New-Object System.Security.AccessControl.FileSystemAccessRule(
                 $userSid, [System.Security.AccessControl.FileSystemRights]::Modify,
                 [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',
                 [System.Security.AccessControl.PropagationFlags]::None,
                 [System.Security.AccessControl.AccessControlType]::Allow)
             $aclDir.AddAccessRule($dirRule)
-            Set-Acl -Path $paths.ReplyDir -AclObject $aclDir
+            Set-Acl -Path $paths.Base -AclObject $aclDir
         } catch {
-            Write-Log "Dialog host: failed to grant user ACL on session files - $($_.Exception.Message)" | Out-Null
+            Write-Log "Dialog host: failed to grant user ACL on session dir - $($_.Exception.Message)" | Out-Null
             # Continue anyway; the host may still work if C:\ProgramData\Temp is open to Users
         }
+        # Now create the SYSTEM-side seed files. They inherit Modify-for-user from the parent dir.
+        New-Item -Path $paths.ReplyDir -ItemType Directory -Force | Out-Null
+        Set-Content -Path $paths.CmdFile -Value "" -Encoding UTF8 -Force
+        Set-Content -Path $paths.CursorFile -Value "0" -Encoding UTF8 -Force
+        Set-Content -Path $paths.HeartbeatFile -Value (Get-Date -Format 'o') -Encoding UTF8 -Force
 
         # Write host script to user's temp (it needs to run under user account)
         $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
@@ -444,9 +443,11 @@ function Start-DialogHost {
         $session.VbsPath  = $launch.VbsPath
         $Script:DialogSession = $session
 
-        # Wait up to 8 s for first heartbeat to confirm the host is up
+        # v9.43: wait up to 15 s for first heartbeat (was 8 s). Cold WPF startup on slower x64
+        # machines + first-run JIT can take longer than 8 s; the previous timeout produced
+        # spurious "did not heartbeat" fallbacks on machines that would have come up fine.
         $waitStart = Get-Date
-        while (((Get-Date) - $waitStart).TotalSeconds -lt 8) {
+        while (((Get-Date) - $waitStart).TotalSeconds -lt 15) {
             if (Test-DialogHostAlive) {
                 Write-Log "Dialog host ready (session $sessionId)" | Out-Null
                 return $true
@@ -454,7 +455,7 @@ function Start-DialogHost {
             Start-Sleep -Milliseconds 200
         }
 
-        Write-Log "Dialog host did not heartbeat within 8 s - falling back to legacy dialogs" | Out-Null
+        Write-Log "Dialog host did not heartbeat within 15 s - falling back to legacy dialogs" | Out-Null
         $Script:DialogLegacyFallback = $true
         Stop-DialogHost -Force | Out-Null
         return $false
@@ -596,17 +597,25 @@ function Stop-DialogHost {
         if ($session.TaskName) {
             Unregister-ScheduledTask -TaskName $session.TaskName -Confirm:$false -ErrorAction SilentlyContinue
         }
-        # v9.36: deliberately preserve $session.LogFile so we can post-mortem any host crash.
-        # Remove-OldTempFiles will sweep these on its normal schedule along with anything else
-        # matching availableUpgrades-dialog-*.
-        foreach ($p in @($session.CmdFile, $session.CursorFile, $session.HeartbeatFile, $session.PidFile, $session.ScriptFile, $session.VbsPath)) {
+        # v9.43: session files now live inside a per-session subdirectory ($session.Base).
+        # Preserve the log by moving it to a sibling location before removing the directory,
+        # so post-mortem on any future host crash still works.
+        if ($session.LogFile -and (Test-Path $session.LogFile)) {
+            try {
+                $preservedLog = Join-Path "C:\ProgramData\Temp" "availableUpgrades-dialog-$($session.SessionId).log"
+                Move-Item -Path $session.LogFile -Destination $preservedLog -Force -ErrorAction Stop
+                Write-Log "Dialog host log preserved at $preservedLog" | Out-Null
+            } catch {
+                Write-Log "Stop-DialogHost: could not preserve log file - $($_.Exception.Message)" | Out-Null
+            }
+        }
+        # Out-of-tree files (script, VBS launcher) live in user temp - remove them separately.
+        foreach ($p in @($session.ScriptFile, $session.VbsPath)) {
             if ($p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
         }
-        if ($session.ReplyDir -and (Test-Path $session.ReplyDir)) {
-            Remove-Item $session.ReplyDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        if ($session.LogFile -and (Test-Path $session.LogFile)) {
-            Write-Log "Dialog host log preserved at $($session.LogFile)" | Out-Null
+        # And blow away the per-session directory in one shot.
+        if ($session.Base -and (Test-Path $session.Base)) {
+            Remove-Item $session.Base -Recurse -Force -ErrorAction SilentlyContinue
         }
         Write-Log "Dialog host stopped (session $($session.SessionId))" | Out-Null
     } catch {
