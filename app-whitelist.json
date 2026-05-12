@@ -401,6 +401,7 @@
             "AppID": "TeamViewer.TeamViewer",
             "FriendlyName": "TeamViewer",
             "Category": "Communication",
+            "Disabled": true,
             "BlockingProcess": "TeamViewer"
         },
         {
