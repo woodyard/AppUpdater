@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.54
- Tag: 54
+ Version: 9.55
+ Tag: 55
     
     Version History:
     1.0 - Initial version
@@ -105,6 +105,7 @@
     9.38 - FIX: When the per-app loop ended without processing any apps (e.g. the only app in the task file was actively deferred and got skipped), the script still sent a `complete` command to the dialog host. The host briefly rendered "Updates complete - 0 apps processed" with its 3-second auto-hide, but Stop-DialogHost fired immediately after and force-killed the host process within ~1 s, producing a visible sub-second flash of the completion panel even though the run was a no-op. Now the final `complete` command is gated on $count -gt 0 so a no-op run leaves the host hidden through teardown.
     9.39 - FIX: WingetUpgradeManager registry state (Deferrals, Failures, ReleaseCache) was being read/written via PSDrive paths like HKLM:\SOFTWARE\WingetUpgradeManager\..., which the Windows WoW64 redirector silently rewrites to HKLM:\SOFTWARE\WOW6432Node\... when the host process is 32-bit. Intune Remediations default to a 32-bit PowerShell host, so all script writes went to WOW6432Node; anything reading from a 64-bit context (manual PowerShell prompt, ad-hoc tooling) saw an empty/stale view. A user with an active Notepad++ deferral was invisible to a 64-bit Get-ChildItem on the non-WOW path while clearly visible at the WOW6432Node path. Fix: introduced $Script:WumRegRoot pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager and routed all 12 call sites through it (later renamed to $Script:AppRegRoot in v9.40). Both 32-bit and 64-bit PowerShell hosts now hit the same physical hive. Chose WOW6432Node-pinned (not 64-bit-pinned via .NET OpenBaseKey) because existing data is already at WOW6432Node from prior 32-bit Intune runs, so no migration is required; the trade-off is that orphaned entries written to the native HKLM:\SOFTWARE\WingetUpgradeManager by old 64-bit runs become invisible to the script (acceptable: those entries were already stale or expired).
     9.40 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot to match. No automatic migration of state from the old WingetUpgradeManager path - existing deferrals, failures, and release cache entries become orphaned. On the next run the script sees an empty state, so users will be re-prompted for any apps with pending updates instead of having their previously-set deferrals honored. Manual cleanup of the orphaned old key is up to the operator: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager' -Recurse -Force.
+    9.55 - FIX: Two issues from the 18:44 field log. (a) SYSTEM was still allowed to try "unknown"-scope tasks (allowedScopes was @("machine","unknown")). With detect.ps1 v5.60's visibility probe in place, anything reaching remediate as "unknown" has been proven invisible-to-SYSTEM during detection - SYSTEM trying anyway wastes the attempt AND bumps the per-version failure counter, which combined with the 3-strikes skip-version dialog can remove the task before the user-context retry handoff gets its turn. Git.Git hit exactly this race: SYSTEM-failure bumped count to 3/3, skip dialog fired, task removed at 18:45:00 - user-context handoff started at 18:45:00 but Git.Git was no longer in the task file. Fix: SYSTEM's allowedScopes is now @("machine") only; "unknown" tasks bypass SYSTEM entirely and go straight to user-context (where v9.54's RunLevel Highest gives admin users the elevation they need). The v9.49 $unknownAlsoOther mechanism becomes redundant and is removed. (b) The "Retry" button on the skip-version dialog was effectively meaningless - both Skip and Retry called Remove-UpgradeTaskEntry regardless, so Retry just suppressed the Skipped=true flag without any other effect. Reported by the user: "I pressed Retry, is there a bug there?" Yes there was. Fixed: Skip behaves as before (set Skipped flag + remove from task file); Retry now clears the accumulated failure count via Clear-VersionFailureData AND keeps the task entry so the next remediation cycle gets a fresh 3-attempt budget against the same version.
     9.54 - FIX: Schedule-UserContextRemediation's task principal RunLevel bumped from Limited to Highest. Some upgrades require admin to write the target install location (Git.Git lives in C:\Program Files\Git\ - the user's winget LocalState knows the catalog binding so the upgrade can be identified, but the install itself needs elevation). At RunLevel Limited the v9.49 user-context retry handoff ran non-elevated and silently failed these machine-scope-needing upgrades. At RunLevel Highest, admin users get an elevated scheduled-task token automatically (no UAC prompt - scheduled tasks at Highest auto-elevate for members of the local Administrators group); non-admin users see no regression (Highest is "max of what the user has", which is still Limited for them). Pairs with detect.ps1 v5.60.
     9.53 - UX: Session-start banner written at the top of each run. Three `=`-bordered lines so a new run is obvious when scrolling a per-day log file that contains many sessions. Banner reads the script's own Version field from the .NOTES block at runtime so it stays in sync without a separate constant to maintain. Format: "===== RemediateAvailableUpgrades v9.53  PID 12345  SYSTEM context  on COMPUTERNAME". Context label distinguishes SYSTEM / user (admin) / user / user-context (handoff).
     9.52 - FIX: Set-SystemSleepBlocked still failed with "Cannot convert value -2147483647 to type System.UInt32" despite v9.48's [uint32] cast. Root cause: PowerShell 5.1 (which is what Intune Remediations run) parses hex literals like 0x80000001 as SIGNED Int32 - the high bit is treated as the sign bit, so the literal evaluates to -2147483647 BEFORE the [uint32] cast even runs. The cast then rejects the negative value. v9.48's cast was a no-op for the same reason. Switched the literals to decimal (2147483648 = 0x80000000, 2147483649 = 0x80000001). PowerShell promotes bare decimals that exceed [Int32]::MaxValue straight to Int64 with no sign trickery, so [uint32]<positive Int64> succeeds and SetThreadExecutionState gets the value it expected all along.
@@ -8233,36 +8234,34 @@ $Script:OtherContextAppIds = @()   # AppIDs routed to the other context, logged 
 $rawTaskList = @(Read-UpgradeTaskFile)
 if ($rawTaskList -and $rawTaskList.Count -gt 0) {
     # Filter the task list down to entries that belong in the current context:
-    #   - SYSTEM: machine-scoped + unknown (SYSTEM has the privileges to install both)
-    #   - User context: user-scoped + unknown (machine entries are SYSTEM's job; running them
-    #     here as non-admin would either fail or trigger UAC)
+    #   - SYSTEM: machine-scoped only (v9.55 dropped "unknown" from SYSTEM's allowed list)
+    #   - User context: user-scoped + unknown (admin user-context can elevate via RunLevel
+    #     Highest, see v9.54, so it covers the unknown-might-be-machine case too)
+    # v9.55 rationale: with detect.ps1 v5.60's SYSTEM-side visibility probe, anything reaching
+    # remediate as "unknown" has already been proven invisible-to-SYSTEM during detection.
+    # Letting SYSTEM try it anyway wastes the attempt AND - worse - bumps the per-version
+    # failure counter, which the previous version of this loop interpreted as a real failure
+    # and could trigger the 3-strikes skip-version dialog before user-context even got its
+    # turn (observed in the 18:44 log for Git.Git). Now unknown-scope tasks bypass SYSTEM
+    # entirely and go straight to user-context.
     $isSystem = (Test-RunningAsSystem)
-    $allowedScopes = if ($isSystem) { @("machine", "unknown") } else { @("user", "unknown") }
+    $allowedScopes = if ($isSystem) { @("machine") } else { @("user", "unknown") }
     $filtered = [System.Collections.ArrayList]::new()
     $skippedIds = [System.Collections.ArrayList]::new()
-    # v9.49: track unknown-scope tasks SYSTEM keeps for itself. When SYSTEM can't actually
-    # upgrade a per-user install (no machine uninstall key, so winget from SYSTEM sees nothing
-    # to do and exits with no output), we still want user-context to retry. So flag these so
-    # the user-context handoff fires after SYSTEM's loop even if no tasks were strictly
-    # "skipped" to the other context.
-    $unknownAlsoOther = [System.Collections.ArrayList]::new()
     foreach ($t in $rawTaskList) {
         $taskScope = if ($t.InstalledScope) { $t.InstalledScope } else { "unknown" }
         if ($allowedScopes -contains $taskScope) {
             $null = $filtered.Add($t)
-            if ($isSystem -and $taskScope -eq "unknown") {
-                $null = $unknownAlsoOther.Add("$($t.AppID)[unknown]")
-            }
         } else {
             $null = $skippedIds.Add("$($t.AppID)[$taskScope]")
         }
     }
     $LIST = $filtered
-    $Script:TasksForOtherContext = $skippedIds.Count + $unknownAlsoOther.Count
-    $Script:OtherContextAppIds = @($skippedIds + $unknownAlsoOther)
+    $Script:TasksForOtherContext = $skippedIds.Count
+    $Script:OtherContextAppIds = @($skippedIds)
     $contextLabel = if ($isSystem) { "SYSTEM" } else { "user" }
     $listCount = $LIST.Count
-    Write-Log -Message "Task file: $($rawTaskList.Count) entries, $listCount routed to $contextLabel context, $($skippedIds.Count) left for the other context, $($unknownAlsoOther.Count) unknown-scope also routed to other for retry"
+    Write-Log -Message "Task file: $($rawTaskList.Count) entries, $listCount routed to $contextLabel context, $($skippedIds.Count) left for the other context"
     if ($listCount -gt 0) {
         $hereIds = ($LIST | ForEach-Object { "$($_.AppID)[$(if ($_.InstalledScope) { $_.InstalledScope } else { 'unknown' })]" }) -join ', '
         Write-Log -Message "$contextLabel work list: $hereIds"
@@ -8882,10 +8881,23 @@ if ($LIST -and $LIST.Count -gt 0) {
                                 Write-Log -Message "3 failures reached for $($appInfo.AppID) - showing skip version dialog"
                                 $skipChoice = Show-VersionSkipDialog -AppName $appInfo.AppID -FriendlyName $okapp.FriendlyName -Version $appInfo.AvailableVersion -FailureCount $newFailCount
                                 if ($skipChoice) {
+                                    # User chose Skip: mark this version as dismissed (detect.ps1 v5.56 honors
+                                    # the flag and won't re-propose it) and drop the task entry so the SYSTEM
+                                    # loop doesn't re-attempt before detect runs again.
                                     Set-VersionSkipped -AppID $appInfo.AppID -Version $appInfo.AvailableVersion
+                                    Remove-UpgradeTaskEntry -AppID $appInfo.AppID
+                                    Write-Log -Message "User chose Skip - version $($appInfo.AvailableVersion) marked dismissed and task removed"
+                                } else {
+                                    # v9.55: user chose Retry (or the dialog timed out). The previous code
+                                    # removed the task and kept the 3/3 failure count regardless, so the
+                                    # "Retry" button was effectively meaningless - the next cycle still saw
+                                    # the app gone and even if detect re-added it the count was still
+                                    # capped, immediately re-prompting. Now Retry clears the failure data
+                                    # and KEEPS the task entry so the next remediate cycle gets a fresh
+                                    # 3-attempt budget against the current version.
+                                    Clear-VersionFailureData -AppID $appInfo.AppID
+                                    Write-Log -Message "User chose Retry (or dialog timed out) - failure count reset, task kept for next cycle"
                                 }
-                                # Final-failure for this version: drop from task file so we do not retry every cycle.
-                                Remove-UpgradeTaskEntry -AppID $appInfo.AppID
                             }
                             if ($dialogResult -and $dialogResult.ProgressSignalFile) {
                                 @{ Success = $false; Message = "Update failed" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
