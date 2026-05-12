@@ -62,6 +62,23 @@ $isSystem   = $identity.IsSystem
 $principal  = New-Object Security.Principal.WindowsPrincipal($identity)
 $isElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
+# winget ships as an MSIX (Microsoft.DesktopAppInstaller) installed per-user, so SYSTEM has
+# no `winget` on PATH. Mirror what the main remediation script does (~ line 7561): resolve
+# the installed App Installer folder under C:\Program Files\WindowsApps\ and invoke
+# winget.exe directly from there. From admin-user this isn't strictly necessary because
+# winget IS on PATH, but using the explicit path makes both contexts behave identically.
+$wingetExe = $null
+$resolvePattern = "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_*64__8wekyb3d8bbwe"
+$resolved = Resolve-Path $resolvePattern -ErrorAction SilentlyContinue
+if ($resolved) {
+    $candidate = Join-Path $resolved[-1].Path "winget.exe"
+    if (Test-Path $candidate) { $wingetExe = $candidate }
+}
+if (-not $wingetExe) {
+    # Fallback to PATH (works for admin-user, fails for SYSTEM if MSIX not provisioned)
+    $wingetExe = (Get-Command winget.exe -ErrorAction SilentlyContinue).Source
+}
+
 $header = @(
     "=== Diagnose-StuckUpgrades $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ==="
     "Run as:     $($identity.Name)"
@@ -70,10 +87,21 @@ $header = @(
     "SessionId:  $((Get-Process -Id $PID).SessionId)"
     "PID:        $PID"
     "Computer:   $env:COMPUTERNAME"
+    "Winget exe: $wingetExe"
     "Winget version:"
 )
 $header | Out-File $logPath -Encoding UTF8
-& winget --version 2>&1 | Out-File $logPath -Append -Encoding UTF8
+if ($wingetExe) {
+    & $wingetExe --version 2>&1 | Out-File $logPath -Append -Encoding UTF8
+} else {
+    "ERROR: winget.exe not found on this machine - cannot continue." | Out-File $logPath -Append -Encoding UTF8
+    Write-Host "winget.exe not found" -ForegroundColor Red
+    return
+}
+
+# winget needs to run from its own install directory (some sub-binaries are loaded by relative
+# path). Match the remediation script: Push-Location into the WindowsApps dir while calling.
+$wingetDir = Split-Path $wingetExe -Parent
 
 foreach ($app in $apps) {
     "" | Out-File $logPath -Append -Encoding UTF8
@@ -81,8 +109,13 @@ foreach ($app in $apps) {
     "" | Out-File $logPath -Append -Encoding UTF8
 
     $start = Get-Date
-    $output = & winget upgrade --silent --disable-interactivity --accept-source-agreements --accept-package-agreements --source winget --id $app 2>&1
-    $exitCode = $LASTEXITCODE
+    Push-Location $wingetDir
+    try {
+        $output = & $wingetExe upgrade --silent --disable-interactivity --accept-source-agreements --accept-package-agreements --source winget --id $app 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
     $duration = ((Get-Date) - $start).TotalSeconds
 
     $output | Out-File $logPath -Append -Encoding UTF8
