@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.51
- Tag: 51
+ Version: 9.52
+ Tag: 52
     
     Version History:
     1.0 - Initial version
@@ -105,6 +105,7 @@
     9.38 - FIX: When the per-app loop ended without processing any apps (e.g. the only app in the task file was actively deferred and got skipped), the script still sent a `complete` command to the dialog host. The host briefly rendered "Updates complete - 0 apps processed" with its 3-second auto-hide, but Stop-DialogHost fired immediately after and force-killed the host process within ~1 s, producing a visible sub-second flash of the completion panel even though the run was a no-op. Now the final `complete` command is gated on $count -gt 0 so a no-op run leaves the host hidden through teardown.
     9.39 - FIX: WingetUpgradeManager registry state (Deferrals, Failures, ReleaseCache) was being read/written via PSDrive paths like HKLM:\SOFTWARE\WingetUpgradeManager\..., which the Windows WoW64 redirector silently rewrites to HKLM:\SOFTWARE\WOW6432Node\... when the host process is 32-bit. Intune Remediations default to a 32-bit PowerShell host, so all script writes went to WOW6432Node; anything reading from a 64-bit context (manual PowerShell prompt, ad-hoc tooling) saw an empty/stale view. A user with an active Notepad++ deferral was invisible to a 64-bit Get-ChildItem on the non-WOW path while clearly visible at the WOW6432Node path. Fix: introduced $Script:WumRegRoot pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager and routed all 12 call sites through it (later renamed to $Script:AppRegRoot in v9.40). Both 32-bit and 64-bit PowerShell hosts now hit the same physical hive. Chose WOW6432Node-pinned (not 64-bit-pinned via .NET OpenBaseKey) because existing data is already at WOW6432Node from prior 32-bit Intune runs, so no migration is required; the trade-off is that orphaned entries written to the native HKLM:\SOFTWARE\WingetUpgradeManager by old 64-bit runs become invisible to the script (acceptable: those entries were already stale or expired).
     9.40 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot to match. No automatic migration of state from the old WingetUpgradeManager path - existing deferrals, failures, and release cache entries become orphaned. On the next run the script sees an empty state, so users will be re-prompted for any apps with pending updates instead of having their previously-set deferrals honored. Manual cleanup of the orphaned old key is up to the operator: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager' -Recurse -Force.
+    9.52 - FIX: Set-SystemSleepBlocked still failed with "Cannot convert value -2147483647 to type System.UInt32" despite v9.48's [uint32] cast. Root cause: PowerShell 5.1 (which is what Intune Remediations run) parses hex literals like 0x80000001 as SIGNED Int32 - the high bit is treated as the sign bit, so the literal evaluates to -2147483647 BEFORE the [uint32] cast even runs. The cast then rejects the negative value. v9.48's cast was a no-op for the same reason. Switched the literals to decimal (2147483648 = 0x80000000, 2147483649 = 0x80000001). PowerShell promotes bare decimals that exceed [Int32]::MaxValue straight to Int64 with no sign trickery, so [uint32]<positive Int64> succeeds and SetThreadExecutionState gets the value it expected all along.
     9.51 - TUNE: Remove-OldTempFiles cutoff bumped from 10 minutes to 60 minutes. The previous 10-minute window was set assuming all script-created temp files were tied to short-lived dialogs and prompts, but a remediation run that processes several large packages (Office, Visual Studio, multi-gigabyte downloads with retries) can easily stay running for 30+ minutes. During that time its own in-flight files would match the cleanup regex and could be deleted out from under it. 60 minutes is comfortably longer than any legitimate single run and still recent enough to catch real orphans on the next startup.
     9.50 - TUNE: Tightened up C:\ProgramData\Temp cleanup. Two gaps closed: (a) Remove-OldTempFiles's regex was missing UserDetection_*.json - so when remediate.ps1 ran its startup cleanup it never touched detect.ps1's leftover result files, and cross-script leftovers accumulated. Regex unified with detect.ps1 v5.53 so each script's startup cleanup catches whatever the other one left behind. (b) The function only scanned files, not directories. With v9.43 the dialog host stores per-session state inside a subdirectory (C:\ProgramData\Temp\availableUpgrades-dialog-<id>\) and Stop-DialogHost normally removes it - but if the script crashes before cleanup or the WPF process orphans the dir somehow, a file-only scan can't see it. Now also enumerates directories matching the same regex and removes them recursively when older than the 10 minute cutoff.
     9.49 - FIX: Unknown-scope tasks never got a user-context retry when SYSTEM couldn't upgrade them. Observed in field: Bicep, VS Code (UserSetup), and Anthropic.Claude are all per-user installs - SYSTEM running `winget upgrade --id X` from its own profile sees nothing to upgrade and exits with no output, so the script logs "Processing completed" + outputLength=0 + empty LASTEXITCODE and the task stays on the list every cycle. detect.ps1 v5.52 fixes most of this by classifying VS Code and Claude correctly (user-scoped) so they're routed to user-context anyway, but apps with no uninstall key at all (Bicep) stay "unknown" - and the routing block's previous logic kept "unknown" tasks in SYSTEM's allowed-list without counting them in $Script:TasksForOtherContext, so the user-context handoff never fired for them. Routing now ALSO counts unknown-scope tasks SYSTEM is keeping as "needs other-context retry too" via a new $unknownAlsoOther list, so user-context is scheduled after SYSTEM's loop and gets a chance to upgrade per-user installs that SYSTEM couldn't see.
@@ -251,12 +252,17 @@ function Set-SystemSleepBlocked {
 public static extern uint SetThreadExecutionState(uint esFlags);
 '@ -ErrorAction Stop
         }
-        # v9.48: cast to [uint32] explicitly. PowerShell parses 0x80000000 / 0x80000001 as
-        # [Int64] (they exceed [Int32]::MaxValue), and Add-Type's `uint` parameter rejects an
-        # Int64 argument with "Cannot convert argument esFlags".
+        # v9.52: use decimal literals to dodge PowerShell 5.1's hex-literal Int32 overflow.
+        # `0x80000001` in PS 5.1 is parsed as a SIGNED Int32 (high bit -> sign bit), giving
+        # -2147483647 before [uint32] can cast it; the cast then refuses the negative value
+        # with "Cannot convert value -2147483647 to type System.UInt32". v9.48's [uint32] cast
+        # was a no-op because the damage was already done at literal-parse time. PowerShell
+        # promotes bare decimals that exceed [Int32]::MaxValue straight to Int64, so the
+        # decimal-then-uint32 cast actually works.
+        #   2147483648 = 0x80000000  (ES_CONTINUOUS)
+        #   2147483649 = 0x80000001  (ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
         if ($Block) {
-            # ES_CONTINUOUS (0x80000000) | ES_SYSTEM_REQUIRED (0x00000001)
-            $r = [Win32.PowerControl]::SetThreadExecutionState([uint32]0x80000001)
+            $r = [Win32.PowerControl]::SetThreadExecutionState([uint32]2147483649)
             if ($r -ne 0) {
                 Write-Log -Message "Sleep blocked for duration of upgrade run" | Out-Null
             } else {
@@ -264,7 +270,7 @@ public static extern uint SetThreadExecutionState(uint esFlags);
             }
         } else {
             # ES_CONTINUOUS alone clears all flags, restoring normal idle behavior
-            [Win32.PowerControl]::SetThreadExecutionState([uint32]0x80000000) | Out-Null
+            [Win32.PowerControl]::SetThreadExecutionState([uint32]2147483648) | Out-Null
             Write-Log -Message "Sleep block cleared" | Out-Null
         }
     } catch {
