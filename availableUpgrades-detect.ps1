@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.47
-    Tag: 77
+    Version: 5.48
+    Tag: 78
     
     Version History:
     1.0 - Initial version
@@ -94,6 +94,7 @@
     5.45 - TUNE: Whitelist cache TTL bumped from 60 min to 36 hours (2160 min). At a once-a-day client cadence the 60-min default never reached the fast-path (cache always >60 min old at next run, always revalidated). 36 h is comfortably longer than a daily cycle including check-in jitter, so the fast-path normally hits and we skip the network entirely. Whitelist edits propagate within ~1.5 days worst case.
     5.46 - FIX: Stripped em-dashes/en-dashes (U+2014, U+2013) from the script and saved with a UTF-8 BOM. Without a BOM, PowerShell 5.1 reads the file as Windows-1252 and the multi-byte UTF-8 sequence for an em-dash decodes to bytes 0xE2 0x80 0x94 - byte 0x94 is a right-quote in Windows-1252 which terminated string literals early and broke the parser ("Unexpected token" cascade starting from the Get-CachedWhitelistJSON function added in 5.44). All Unicode dashes replaced with ASCII hyphen-minus.
     5.47 - FIX: Get-CachedWhitelistJSON returned its log line concatenated with the cached body, so $whitelistJSON was "Using cached whitelist (age 0.6 min...) {actual JSON}" and ConvertFrom-Json failed with "Invalid JSON primitive". Root cause: Write-Log pipes through Out-File internally and emits to the success stream under some conditions; every other value-returning function in the script already pipes Write-Log to Out-Null for this reason - I missed it on the new function. All Write-Log calls inside Get-CachedWhitelistJSON now end with `| Out-Null`. Also added a defensive validator: cached and fetched bodies are checked to start with `{` or `[` before being used; corrupt cache files are auto-deleted so the next run re-fetches.
+    5.48 - TUNE: $LogDate dropped its _HH-mm component, so all detection runs on the same calendar day now append to a single DetectAvailableUpgrades-DD-MM-YY.log file instead of producing a new file per session. Mirrors remediate.ps1 v9.35. Remove-OldLogs's 1-month retention is unchanged.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -1549,7 +1550,7 @@ function Invoke-UserContextDetection {
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
 $ScriptTag = "77" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
-$LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
+$LogDate = Get-Date -Format dd-MM-yy # EU format; per-day rollover so all runs in one day share a log file
 $LogFullName = "$LogName-$LogDate.log"
 
 # Capture script path at global scope for use in scheduled tasks
