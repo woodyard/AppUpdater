@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.57
-    Tag: 87
+    Version: 5.58
+    Tag: 88
     
     Version History:
     1.0 - Initial version
@@ -97,6 +97,7 @@
     5.48 - TUNE: $LogDate dropped its _HH-mm component, so all detection runs on the same calendar day now append to a single DetectAvailableUpgrades-DD-MM-YY.log file instead of producing a new file per session. Mirrors remediate.ps1 v9.35. Remove-OldLogs's 1-month retention is unchanged.
     5.49 - FIX: WingetUpgradeManager deferral reads were going through PSDrive HKLM:\SOFTWARE\WingetUpgradeManager\..., which the WoW64 redirector rewrites to WOW6432Node for 32-bit PowerShell hosts. Combined with remediate.ps1 also being WoW64-redirected when run from Intune (32-bit default), data was effectively at WOW6432Node but invisible to 64-bit ad-hoc inspection. Switched the one deferral-read site here to $Script:WumRegRoot (pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager; later renamed to $Script:AppRegRoot in v5.50) so detect.ps1 and remediate.ps1 v9.39 always agree on where deferral state lives regardless of host bitness.
     5.50 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot. Mirrors remediate.ps1 v9.40. No automatic migration - existing state at the old path is orphaned.
+    5.58 - FIX: Get-AppInstalledScope now applies layered fallback heuristics when the uninstall-registry walk returns "unknown". Real installs are always machine or user; "unknown" is a script limitation, not a real state. Three fallbacks fire in sequence: (A) MSIX/AppX suffix in the AppID (Microsoft Store packages, MSIX-flavoured entries) -> user, since Store-backed apps are by definition per-user; (B) walk the interactive user's %LOCALAPPDATA%\Programs and %LOCALAPPDATA% for a directory whose name matches any of the search terms - catches per-user installs that skip ARP entirely (Bicep ships as a single .exe in a user dir; Claude installs to %LOCALAPPDATA%\Programs\claude-desktop\); (C) walk %PROGRAMFILES% and %PROGRAMFILES(x86)% for the rare machine install that didn't write an uninstall key. From SYSTEM context we resolve the interactive user's profile path via Get-InteractiveUser so the per-user walk targets the right user. After these fallbacks, "unknown" should be a very rare outcome.
     5.57 - REFACTOR: v5.56's failure-data interpretation was a separate inline implementation - it happened to produce the same answers as remediate.ps1's Get-VersionFailureData, but the user correctly pointed out that the two scripts should literally share interpretation logic so they cannot drift apart. Get-VersionFailureData copied verbatim from remediate.ps1 into detect.ps1 (alongside the existing AppReg* helpers), and detect's per-app check now calls it directly. Same field names, same comparison semantics, same default-on-version-mismatch return shape. No behaviour change vs v5.56 - just structural alignment so any future change to failure-tracking semantics in remediate is automatically reflected in detect by porting the same one function.
     5.56 - FEATURE: Detect now respects per-version dismissals from the remediate.ps1 skip-version dialog, and logs prior-run failure counts informationally. Mechanics: when remediate hits 3 failures for the same version, it shows a "Skip this version?" dialog. Clicking Skip calls Set-VersionSkipped which writes Skipped="true" + FailedVersion=<that version> under Failures\<AppID>. Previously detect ignored this and re-proposed the same dismissed version on every cycle - remediate would retry, fail, show the dialog again, the user would dismiss again, ad infinitum. Now detect reads Failures\<AppID>\Skipped + FailedVersion at the start of the per-app loop (alongside the existing deferral check) and skips apps whose Skipped=true AND FailedVersion matches the current AvailableVersion. A new version makes the dismissal irrelevant, so the cycle naturally resumes when there's actually something different to install. Also added a "Version-dismissed: ..." summary line next to the existing "Deferred: ..." line so the [ScriptTag] block makes the state explicit, and logs prior failure count ("X has failed N time(s) for version V - allowing another attempt") when failures exist but the user hasn't dismissed yet.
     5.55 - UX: Session-start banner written at the top of each run, mirrors remediate.ps1 v9.53. Three `=`-bordered lines that read "===== DetectAvailableUpgrades v5.55  PID 12345  SYSTEM context  on COMPUTERNAME". Version is read from .NOTES at runtime so it stays in sync without a separate constant.
@@ -1011,6 +1012,92 @@ function Get-AppInstalledScope {
             $resolvedScope = "user"; $decisionBy = "hive"
         } elseif ($machineHits.Count -gt 0) {
             $resolvedScope = "machine"; $decisionBy = "hive(both)"
+        }
+
+        # v5.58: layered fallback heuristics. The registry walk above can return "unknown"
+        # because the app doesn't write an ARP uninstall entry at all (Bicep ships as a
+        # single .exe), or because its DisplayName doesn't match our search terms, or
+        # because we couldn't read the user's HKU hive (not loaded, ACL, etc.). Real
+        # installs are always either machine or user; "unknown" is a script limitation,
+        # not a real state. The fallbacks try cheap heuristics first, then a filesystem
+        # walk in the interactive user's profile - real per-user installs almost always
+        # leave a footprint in %LOCALAPPDATA%\Programs\, even when they skip ARP.
+        if ($resolvedScope -eq "unknown") {
+            # Heuristic A: MSIX / AppX suffix in the AppID. Microsoft Store packages and
+            # MSIX-flavoured winget entries are by definition per-user (Store-backed).
+            if ($AppID -match '\.MSIX$' -or $AppID -match '\.appx$') {
+                $resolvedScope = "user"; $decisionBy = "MSIX-suffix"
+            }
+        }
+
+        if ($resolvedScope -eq "unknown") {
+            # Heuristic B: walk the interactive user's local-programs directories for
+            # a directory whose name matches one of our search terms. Catches per-user
+            # installs that don't write ARP entries (Bicep, Claude in claude-desktop,
+            # etc.). From SYSTEM we resolve the interactive user's profile path; from
+            # user context we use %LOCALAPPDATA% directly.
+            try {
+                $userLocalAppData = $null
+                if (Test-RunningAsSystem) {
+                    $userInfo = Get-InteractiveUser
+                    if ($userInfo -and $userInfo.Username) {
+                        $userLocalAppData = "C:\Users\$($userInfo.Username)\AppData\Local"
+                    }
+                } else {
+                    $userLocalAppData = $env:LOCALAPPDATA
+                }
+                if ($userLocalAppData -and (Test-Path $userLocalAppData)) {
+                    # Most per-user installs land in either of these:
+                    $userInstallRoots = @(
+                        (Join-Path $userLocalAppData 'Programs'),
+                        $userLocalAppData
+                    ) | Where-Object { Test-Path $_ }
+                    foreach ($root in $userInstallRoots) {
+                        $dirHit = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
+                            Where-Object {
+                                $candName = $_.Name
+                                foreach ($t in $searchTerms) {
+                                    if ($candName -like "*$t*") { return $true }
+                                }
+                                return $false
+                            } | Select-Object -First 1
+                        if ($dirHit) {
+                            $resolvedScope = "user"; $decisionBy = "user-fs-walk"
+                            $sampleLoc = $dirHit.FullName
+                            break
+                        }
+                    }
+                }
+            } catch {
+                Write-Log "Scope detection: user-fs-walk error for $AppID : $($_.Exception.Message)" | Out-Null
+            }
+        }
+
+        if ($resolvedScope -eq "unknown") {
+            # Heuristic C: machine-side filesystem fallback. Same idea as B but for
+            # Program Files. Rare in practice (machine installs almost always write
+            # ARP entries) but covers the corner case where a vendor's installer
+            # skips the uninstall key.
+            try {
+                $machineRoots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ -and (Test-Path $_) }
+                foreach ($root in $machineRoots) {
+                    $dirHit = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
+                        Where-Object {
+                            $candName = $_.Name
+                            foreach ($t in $searchTerms) {
+                                if ($candName -like "*$t*") { return $true }
+                            }
+                            return $false
+                        } | Select-Object -First 1
+                    if ($dirHit) {
+                        $resolvedScope = "machine"; $decisionBy = "machine-fs-walk"
+                        $sampleLoc = $dirHit.FullName
+                        break
+                    }
+                }
+            } catch {
+                Write-Log "Scope detection: machine-fs-walk error for $AppID : $($_.Exception.Message)" | Out-Null
+            }
         }
 
         $sampleSuffix = if ($sampleLoc) { " sample='$sampleLoc'" } else { "" }
