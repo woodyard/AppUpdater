@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.33
- Tag: 33
+ Version: 9.34
+ Tag: 34
     
     Version History:
     1.0 - Initial version
@@ -98,6 +98,7 @@
     9.31 - PERF: Dialogs now appear ~2-3 s faster. Three cold-start reductions in every scheduled-task-launched dialog (informational progress, mandatory update, deferral, completion notification, user prompt): (a) Added -NoProfile to the spawned powershell.exe so user profile customizations (e.g. Oh My Posh) no longer load before the WPF window renders - saved ~1-2 s on profiles with prompt frameworks. (b) Collapsed four separate Add-Type -AssemblyName calls into one combined call - PresentationFramework, PresentationCore, WindowsBase loaded together is noticeably faster than four sequential calls. (c) Dropped System.Windows.Forms from four of the five dialog scripts that only used it for [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; replaced with WPF's [System.Windows.SystemParameters]::WorkArea which is part of the already-loaded WindowsBase assembly - saves a whole extra assembly load (~500 ms). Net effect: the upgrade progress dialog now renders before winget finishes downloading instead of after, fixing the "dialogs appear after the work is done" symptom.
     9.32 - FEATURE (foundation): Persistent dialog host - replaces the per-app dialog spawn pattern with a single long-lived WPF window that swaps content as remediation progresses. This commit adds only the foundation (command protocol, host script, lifecycle helpers); the existing Show-* / Invoke-System* functions are unchanged and still spawn per-dialog scheduled tasks. Next commit wires them through Send-DialogCommand with the legacy spawn kept as fallback. Protocol: JSON-lines appended to C:\ProgramData\Temp\availableUpgrades-dialog-<sessionId>.cmd, host pumps every 250 ms and replies via per-id files in the .replies dir; heartbeat + PID file make liveness verifiable in <10 s. Window has 5 panels (Progress, Transition, Completion, Mandatory, Deferral, Skip) toggled via Visibility; only one renders at a time. Cross-context handshake reuses the Schedule-UserContextRemediation pattern - SYSTEM starts the host and passes -DialogSessionId to user-context, which connects to the same files. Lifecycle is SYSTEM-owned: Stop-DialogHost is called after user-context handoff completes (or after SYSTEM's own loop if no handoff). User dismissal via X-button sets a session-scoped suppression flag; subsequent fire-and-forget commands (show-progress/status/transition/complete) are silently swallowed but blocking prompt-* commands (mandatory/deferral/skip) always force the window back into view because they require an explicit answer. Day-scoped SuppressInfoDialogs flag becomes obsolete in the new path (still honored by legacy fallback). Stale-task sweep and temp-file cleanup regex updated for the new DialogHost_ / availableUpgrades-dialog- patterns.
     9.33 - FEATURE (wire-up): Routes every dialog through the persistent dialog host introduced in v9.32; legacy per-app scheduled-task spawn is retained as fallback when the host is unavailable. New script parameter -DialogSessionId lets user-context attach to the SYSTEM-owned session via Connect-DialogSession; Schedule-UserContextRemediation appends -DialogSessionId to the user-context launch args only when Test-DialogHostAlive. Start-DialogHost runs once at the top of the main remediation block in SYSTEM context; Stop-DialogHost runs on both exit paths gated on (-not $UserRemediationOnly) so user-context never tears down a host SYSTEM started. Wrappers added at the public entry points: Show-CompletionNotification -> complete; Show-UpgradeProgressNotification -> show-progress (returns $null on host path so legacy signal-file callers no-op); Write-InfoDialogStatus -> status (routes to host whenever alive, independent of SignalFilePath); Show-MandatoryUpdateDialog -> prompt-mandatory ("upgrade"/"timeout" both mean proceed, returns "Continue"); Show-DeferralDialog -> prompt-mandatory for ForceUpdate, prompt-deferral otherwise; Show-VersionSkipDialog -> prompt-skip. Main loop emits a `transition` command between successive apps using $Script:DialogPrevApp; after the foreach loop ends, a final `complete` reports total apps processed + overall success/failure, triggering the host's 3 s auto-hide. Show-ProcessCloseDialog and the general-purpose Yes/No prompts (Show-UserDialog, Invoke-SystemUserPrompt, Show-ModernDialog, Show-DirectUserDialog) are intentionally left on the legacy path - their UX doesn't match any of the six host panels yet.
+    9.34 - FIX: Two defects observed during the first v9.33 live run. (a) Dialog stayed on screen after "Dialog host stopped" was logged. The graceful "shutdown" command sometimes never lands (host's pump tick can collide with the parent appending to the cmd file, or the final complete+shutdown arrive between pump ticks and the wait-loop exits before they're processed). Stop-DialogHost now records the host PID before tearing down session files, and if the process is still alive after the 5 s graceful window it calls Stop-Process -Force so the WPF window goes away with the process. (b) The window position was set to (workArea.Bottom - 200) before any panel was visible, but SizeToContent="Height" then expanded the window downward as panels filled in, sometimes pushing it below the taskbar (depending on monitor and panel height). Replaced the one-shot position with a Reposition-AnchoredBottomRight helper bound to $window.Add_SizeChanged so the window stays anchored 20 px above the taskbar regardless of which panel is showing.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -520,6 +521,18 @@ function Stop-DialogHost {
     if (-not $Script:DialogSession) { return }
     $session = $Script:DialogSession
     try {
+        # Capture the host PID before we start tearing things down so we can
+        # force-kill the process if the graceful shutdown command never lands
+        # (v9.34: observed in field that after fast remediation runs the dialog
+        # could stay on screen showing stale Progress content even though all
+        # session files had been cleaned up).
+        $hostPid = $null
+        try {
+            if ($session.PidFile -and (Test-Path $session.PidFile)) {
+                $hostPid = [int]((Get-Content $session.PidFile -Raw -ErrorAction Stop).Trim())
+            }
+        } catch {}
+
         if (-not $Force -and (Test-DialogHostAlive)) {
             Send-DialogCommand -Cmd "shutdown" | Out-Null
             $waitStart = Get-Date
@@ -528,6 +541,20 @@ function Stop-DialogHost {
                 Start-Sleep -Milliseconds 200
             }
         }
+
+        # Force-kill if the host process is still running after the graceful window
+        # (or if -Force was specified). Without this, the WPF window can outlive
+        # our session-file cleanup and stay on screen with stale content.
+        if ($hostPid) {
+            $proc = Get-Process -Id $hostPid -ErrorAction SilentlyContinue
+            if ($proc) {
+                Write-Log "Dialog host PID $hostPid still alive after shutdown - force-killing" | Out-Null
+                try { Stop-Process -Id $hostPid -Force -ErrorAction Stop } catch {
+                    Write-Log "Stop-Process failed for dialog host PID $hostPid : $($_.Exception.Message)" | Out-Null
+                }
+            }
+        }
+
         if ($session.TaskName) {
             Unregister-ScheduledTask -TaskName $session.TaskName -Confirm:$false -ErrorAction SilentlyContinue
         }
@@ -687,8 +714,21 @@ try {
 
     $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
     $window = [Windows.Markup.XamlReader]::Load($reader)
-    $window.Left = $workArea.Right  - 460
-    $window.Top  = $workArea.Bottom - 200
+    # v9.34: anchor the window to the bottom-right of the work area on every size change.
+    # The previous fixed Top of (Bottom - 200) was set before content existed; SizeToContent
+    # then expanded the window downward and pushed it below the taskbar on the active monitor.
+    $script:anchorMargin = 20
+    $script:anchorRight  = 20
+    function Reposition-AnchoredBottomRight {
+        $h = if ($window.ActualHeight -gt 0) { $window.ActualHeight } else { $window.Height }
+        if (-not $h -or $h -le 0) { $h = 140 }
+        $w = if ($window.ActualWidth -gt 0) { $window.ActualWidth } else { $window.Width }
+        if (-not $w -or $w -le 0) { $w = 440 }
+        $window.Left = $workArea.Right  - $w - $script:anchorRight
+        $window.Top  = $workArea.Bottom - $h - $script:anchorMargin
+    }
+    $window.Add_SizeChanged({ Reposition-AnchoredBottomRight })
+    Reposition-AnchoredBottomRight
     $window.Hide() | Out-Null
 
     # Element refs
