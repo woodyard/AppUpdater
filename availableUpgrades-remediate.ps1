@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.37
- Tag: 37
+ Version: 9.38
+ Tag: 38
     
     Version History:
     1.0 - Initial version
@@ -102,6 +102,7 @@
     9.35 - TUNE: $LogDate dropped its _HH-mm component, so all remediation runs on the same calendar day now append to a single RemediateAvailableUpgrades-DD-MM-YY.log file instead of producing a new file per session. Easier to follow a day's activity in one read; Remove-OldLogs's 1-month retention is unchanged so disk growth is bounded.
     9.36 - FIX: When the persistent dialog host dies mid-prompt (Send-DialogCommand returns $null), the blocking-prompt wrappers (Show-MandatoryUpdateDialog, Show-DeferralDialog, Show-VersionSkipDialog) used to silently default to the "proceed with upgrade" outcome. Observed in field on a Notepad++ run with a running blocking process: host went away ~5s after the prompt-deferral command was sent, the deferral wrapper returned Action=Update without surfacing any dialog, and the user's app was force-closed and updated with no opportunity to defer. Wrappers now only commit to the host's reply when a non-null reply comes back; otherwise they fall through to the legacy WPF spawn so the user still sees a dialog. Also: Stop-DialogHost no longer deletes the host's $session.LogFile, so when the host does die its log survives for post-mortem (Remove-OldTempFiles still sweeps it on its normal schedule). And the misleading hardcoded "Starting persistent dialog host (v9.33)" log line was made version-agnostic.
     9.37 - FIX: Root cause of the dialog host crashing one second into prompt-deferral (and presumably prompt-mandatory, prompt-skip, and the completion auto-hide). The dispatcher timers' Add_Tick script blocks referenced function-local variables ($updateBtn, $btn, $countdown, $hideTimer) defined inside Process-Command's switch arms; by the time the dispatcher fired the timer, Process-Command had returned and those locals were out of scope, resolving to $null. The countdown's `$updateBtn.Content = ...` then threw "The property 'Content' cannot be found on this object", which escaped $app.Run() and exited the host process. Preserved host log from session 25886aac6a4c made this immediately visible (`FATAL: ... Run ... property 'Content' cannot be found`). Fix: every dispatcher closure now reads through $script:blocking (script-scoped) for button + timer references, with Button stored at hashtable creation and timers added once they exist. Each Add_Tick body is also wrapped in try/catch (logs to host log via Write-DH but doesn't crash the dispatcher). Same scope fix applied to complete's hideTimer ($script:hideTimer). Added an Application.DispatcherUnhandledException handler as a final safety net so any future unanticipated exception inside a dispatcher event is logged and swallowed rather than killing the host.
+    9.38 - FIX: When the per-app loop ended without processing any apps (e.g. the only app in the task file was actively deferred and got skipped), the script still sent a `complete` command to the dialog host. The host briefly rendered "Updates complete - 0 apps processed" with its 3-second auto-hide, but Stop-DialogHost fired immediately after and force-killed the host process within ~1 s, producing a visible sub-second flash of the completion panel even though the run was a no-op. Now the final `complete` command is gated on $count -gt 0 so a no-op run leaves the host hidden through teardown.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -8622,7 +8623,10 @@ if ($LIST -and $LIST.Count -gt 0) {
         # v9.33: signal end of upgrade run to the persistent dialog host so it shows the final
         # completion panel and auto-hides after 3 s. No-op when host is not alive (legacy spawn
         # already wrote completion signals per-app).
-        if (Test-DialogHostAlive) {
+        # v9.38: only fire the completion panel when at least one app was actually processed;
+        # otherwise the host briefly flashes "Updates complete - 0 apps processed" before
+        # Stop-DialogHost tears it down, which the user sees as a sub-second dialog flicker.
+        if ((Test-DialogHostAlive) -and ($count -gt 0)) {
             $hadFailure = ($message -match '\(FAILED\)' -or $message -match '\(ERROR\)')
             $body = if ($count -eq 1) { "1 app processed" } else { "$count apps processed" }
             Send-DialogCommand -Cmd "complete" -Payload @{
