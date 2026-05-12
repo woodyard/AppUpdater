@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.52
-    Tag: 82
+    Version: 5.53
+    Tag: 83
     
     Version History:
     1.0 - Initial version
@@ -97,6 +97,7 @@
     5.48 - TUNE: $LogDate dropped its _HH-mm component, so all detection runs on the same calendar day now append to a single DetectAvailableUpgrades-DD-MM-YY.log file instead of producing a new file per session. Mirrors remediate.ps1 v9.35. Remove-OldLogs's 1-month retention is unchanged.
     5.49 - FIX: WingetUpgradeManager deferral reads were going through PSDrive HKLM:\SOFTWARE\WingetUpgradeManager\..., which the WoW64 redirector rewrites to WOW6432Node for 32-bit PowerShell hosts. Combined with remediate.ps1 also being WoW64-redirected when run from Intune (32-bit default), data was effectively at WOW6432Node but invisible to 64-bit ad-hoc inspection. Switched the one deferral-read site here to $Script:WumRegRoot (pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager; later renamed to $Script:AppRegRoot in v5.50) so detect.ps1 and remediate.ps1 v9.39 always agree on where deferral state lives regardless of host bitness.
     5.50 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot. Mirrors remediate.ps1 v9.40. No automatic migration - existing state at the old path is orphaned.
+    5.53 - TUNE: Remove-OldTempFiles regex extended to include availableUpgrades-dialog-* (remediate's persistent dialog host artifacts) and the function now scans DIRECTORIES, not just files. Previously a crash inside remediate.ps1 that left the per-session dialog subdirectory (C:\ProgramData\Temp\availableUpgrades-dialog-<id>\) on disk meant the directory survived forever - the file-only cleanup couldn't see it. Mirrors remediate.ps1 v9.50.
     5.52 - FIX: Get-AppInstalledScope's search-term list included the standalone publisher prefix from a dotted AppID (e.g. "Microsoft" for Microsoft.VisualStudioCode, "Google" for Google.Chrome). For prolific publishers this matched dozens of unrelated uninstall entries - 97 hits for "Microsoft" was typical on a machine with VS Code, Office, Azure tools, etc. - and the path-hint heuristic then picked an InstallLocation sample from a completely unrelated entry (e.g. "Microsoft Shared\VSTO\10.0" as the sample for Microsoft.VisualStudioCode), driving the routing decision off a cliff. Observed in field: Microsoft.VisualStudioCode (per-user UserSetup install in %LOCALAPPDATA%) and Microsoft.Bicep (no uninstall key at all) were both classified as "machine" because of these false matches, so SYSTEM-context remediation accepted them and then quietly failed to upgrade them. Anthropic.Claude correctly returned "unknown" but was kept in SYSTEM's list with no user-context fallback. Fix: dropped the standalone $idParts[0] term from the search list. Joined "Vendor Product" and product-only $idParts[-1] terms remain, which are what actually match real DisplayNames.
     5.51 - FIX: PSDrive registry access was being double-redirected by WoW64 (see remediate.ps1 v9.42 for the full diagnosis). Switched the one deferral-read site here to Open-AppRegKey / Get-AppRegValue / Test-AppRegKey helpers that go through [Microsoft.Win32.RegistryKey]::OpenBaseKey(LocalMachine, Registry64). Detect and remediate now both read/write at HKLM:\SOFTWARE\AppUpdater regardless of host bitness.
 
@@ -195,46 +196,52 @@ function Remove-OldTempFiles {
         response files, etc.). Uses a 10-minute cutoff since these files are only
         needed while a dialog or task is active.
     #>
-    # 10-minute cutoff: these files are only needed while a task/dialog is active.
-    # Anything older is leftover from a previous run and safe to remove.
+    # v5.53: regex now includes availableUpgrades-dialog-* (remediate.ps1's persistent dialog
+    # host artifacts) and the function also scans DIRECTORIES, not just files. With v9.43
+    # remediate.ps1 stores per-session dialog state inside a subdir like
+    # C:\ProgramData\Temp\availableUpgrades-dialog-<sessionId>\ - if Stop-DialogHost couldn't
+    # tear it down (process crash, etc.) the previous file-only scan left the whole subtree
+    # behind. Mirrors remediate.ps1 v9.50 so each script's startup cleanup is comprehensive.
     $cutoff = (Get-Date).AddMinutes(-10)
     $removed = 0
 
-    # Match file patterns from both detection and remediation scripts
-    # Using regex instead of -Filter because Windows filter matching is unreliable with multiple dots (e.g. .ps1.userdetection)
-    $nameRegex = '^(UserDetection_(Fallback_)?\d+\.json$|availableUpgrades-detect_\d+\.ps1|availableUpgrades-remediate_\d+\.ps1|UserRemediation_\d+\.|UserRemediationHeartbeat_|MandatoryPrompt_.*_(Response|Progress)|Show-MandatoryPrompt_|DeferralPrompt_.*_Response|Show-DeferralPrompt_|UserPrompt_.*_Response|Show-UserPrompt_|UpgradeProgress_.*_(Signal|Status)|Show-UpgradeProgress_|CompletionNotification_|Show-CompletionNotification_|SkipPrompt_.*_Response|Show-SkipPrompt_|UserContext_Debug|UserContext_Heartbeat_Error_|HiddenLaunch_\d+\.vbs$)'
+    $nameRegex = '^(UserDetection_(Fallback_)?\d+\.json$|UserRemediation_\d+\.|UserRemediationHeartbeat_|availableUpgrades-detect_\d+\.ps1|availableUpgrades-remediate_\d+\.ps1|availableUpgrades-dialog-|MandatoryPrompt_.*_(Response|Progress)|Show-MandatoryPrompt_|DeferralPrompt_.*_Response|Show-DeferralPrompt_|UserPrompt_.*_Response|Show-UserPrompt_|UpgradeProgress_.*_(Signal|Status)|Show-UpgradeProgress_|CompletionNotification_|Show-CompletionNotification_|SkipPrompt_.*_Response|Show-SkipPrompt_|UserContext_Debug|UserContext_Heartbeat_Error_|HiddenLaunch_\d+\.vbs$)'
 
-    # Scan C:\ProgramData\Temp
-    $tempPath = "C:\ProgramData\Temp"
-    if (Test-Path $tempPath) {
-        Get-ChildItem -Path $tempPath -File -ErrorAction SilentlyContinue |
+    $scanLocation = {
+        param([string]$path)
+        if (-not (Test-Path $path)) { return 0 }
+        $local:n = 0
+        Get-ChildItem -Path $path -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
             ForEach-Object {
                 Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-                $removed++
+                $local:n++
             }
+        Get-ChildItem -Path $path -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
+            ForEach-Object {
+                Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                $local:n++
+            }
+        return $local:n
     }
 
-    # Scan user temp directories for VBS launchers and dialog script/response files
+    $removed += & $scanLocation "C:\ProgramData\Temp"
+
     try {
         $userTempPaths = Get-ChildItem -Path "C:\Users" -Directory -ErrorAction SilentlyContinue |
             ForEach-Object { Join-Path $_.FullName "AppData\Local\Temp" } |
             Where-Object { Test-Path $_ }
 
         foreach ($userTemp in $userTempPaths) {
-            Get-ChildItem -Path $userTemp -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
-                ForEach-Object {
-                    Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-                    $removed++
-                }
+            $removed += & $scanLocation $userTemp
         }
     } catch {
         # Don't let user temp cleanup failures block the main script
     }
 
     if ($removed -gt 0) {
-        Write-Log -Message "Cleaned up $removed old temp files"
+        Write-Log -Message "Cleaned up $removed old temp files/directories"
     }
 }
 

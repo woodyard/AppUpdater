@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.49
- Tag: 49
+ Version: 9.50
+ Tag: 50
     
     Version History:
     1.0 - Initial version
@@ -105,6 +105,7 @@
     9.38 - FIX: When the per-app loop ended without processing any apps (e.g. the only app in the task file was actively deferred and got skipped), the script still sent a `complete` command to the dialog host. The host briefly rendered "Updates complete - 0 apps processed" with its 3-second auto-hide, but Stop-DialogHost fired immediately after and force-killed the host process within ~1 s, producing a visible sub-second flash of the completion panel even though the run was a no-op. Now the final `complete` command is gated on $count -gt 0 so a no-op run leaves the host hidden through teardown.
     9.39 - FIX: WingetUpgradeManager registry state (Deferrals, Failures, ReleaseCache) was being read/written via PSDrive paths like HKLM:\SOFTWARE\WingetUpgradeManager\..., which the Windows WoW64 redirector silently rewrites to HKLM:\SOFTWARE\WOW6432Node\... when the host process is 32-bit. Intune Remediations default to a 32-bit PowerShell host, so all script writes went to WOW6432Node; anything reading from a 64-bit context (manual PowerShell prompt, ad-hoc tooling) saw an empty/stale view. A user with an active Notepad++ deferral was invisible to a 64-bit Get-ChildItem on the non-WOW path while clearly visible at the WOW6432Node path. Fix: introduced $Script:WumRegRoot pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager and routed all 12 call sites through it (later renamed to $Script:AppRegRoot in v9.40). Both 32-bit and 64-bit PowerShell hosts now hit the same physical hive. Chose WOW6432Node-pinned (not 64-bit-pinned via .NET OpenBaseKey) because existing data is already at WOW6432Node from prior 32-bit Intune runs, so no migration is required; the trade-off is that orphaned entries written to the native HKLM:\SOFTWARE\WingetUpgradeManager by old 64-bit runs become invisible to the script (acceptable: those entries were already stale or expired).
     9.40 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot to match. No automatic migration of state from the old WingetUpgradeManager path - existing deferrals, failures, and release cache entries become orphaned. On the next run the script sees an empty state, so users will be re-prompted for any apps with pending updates instead of having their previously-set deferrals honored. Manual cleanup of the orphaned old key is up to the operator: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager' -Recurse -Force.
+    9.50 - TUNE: Tightened up C:\ProgramData\Temp cleanup. Two gaps closed: (a) Remove-OldTempFiles's regex was missing UserDetection_*.json - so when remediate.ps1 ran its startup cleanup it never touched detect.ps1's leftover result files, and cross-script leftovers accumulated. Regex unified with detect.ps1 v5.53 so each script's startup cleanup catches whatever the other one left behind. (b) The function only scanned files, not directories. With v9.43 the dialog host stores per-session state inside a subdirectory (C:\ProgramData\Temp\availableUpgrades-dialog-<id>\) and Stop-DialogHost normally removes it - but if the script crashes before cleanup or the WPF process orphans the dir somehow, a file-only scan can't see it. Now also enumerates directories matching the same regex and removes them recursively when older than the 10 minute cutoff.
     9.49 - FIX: Unknown-scope tasks never got a user-context retry when SYSTEM couldn't upgrade them. Observed in field: Bicep, VS Code (UserSetup), and Anthropic.Claude are all per-user installs - SYSTEM running `winget upgrade --id X` from its own profile sees nothing to upgrade and exits with no output, so the script logs "Processing completed" + outputLength=0 + empty LASTEXITCODE and the task stays on the list every cycle. detect.ps1 v5.52 fixes most of this by classifying VS Code and Claude correctly (user-scoped) so they're routed to user-context anyway, but apps with no uninstall key at all (Bicep) stay "unknown" - and the routing block's previous logic kept "unknown" tasks in SYSTEM's allowed-list without counting them in $Script:TasksForOtherContext, so the user-context handoff never fired for them. Routing now ALSO counts unknown-scope tasks SYSTEM is keeping as "needs other-context retry too" via a new $unknownAlsoOther list, so user-context is scheduled after SYSTEM's loop and gets a chance to upgrade per-user installs that SYSTEM couldn't see.
     9.48 - FIX: Two related defects. (a) Set-SystemSleepBlocked threw "Cannot convert argument esFlags" because PowerShell parses 0x80000000 / 0x80000001 as [Int64] (they exceed [Int32]::MaxValue) and Add-Type's `uint` parameter rejects an Int64. Cast both literals to [uint32] explicitly. (b) During multi-app remediation runs the dialog hid in the middle of a later app's progress, then came back, etc. Cause: per-app Show-CompletionNotification sends a `complete` command which starts the host's 3-second auto-hide timer; when the loop moved to the next app and sent `transition` / `show-progress`, the new commands brought the window back via Ensure-Visible but the prior hideTimer was still ticking - it fired later and hid the window mid-progress on the new app. Process-Command now cancels any pending $script:hideTimer the moment a new non-lifecycle command arrives (anything other than `hide` / `shutdown`), so only the FINAL complete - the one with no follow-up commands - actually gets to auto-hide.
     9.47 - FIX: Dialog jumped straight from "Preparing download..." to "Installing update..." without ever showing a "Downloading..." status for small/fast apps. v9.44's install-phase latch ran BEFORE the download-progress regex on each poll, so on the very first 2 s poll if winget had already finished downloading (Successfully verified installer hash already in $outText), $installPhase tripped immediately and the download-progress branch was skipped forever. Inverted the order: every poll now parses download progress FIRST and writes "Downloading X MB / Y MB" (or "Downloading XX%", or generic "Downloading update..." if neither is parseable yet), THEN checks for install-phase phrases. For fast downloads where both apply in the same poll, the user sees a brief "Downloading..." flash before the latched "Installing update...". For slow downloads the size/percentage ticks visibly upward, then transitions to "Installing update..." once an install-phase phrase appears. Once $installPhase latches it never reverts.
@@ -6622,27 +6623,52 @@ function Remove-OldLogs {
 function Remove-OldTempFiles {
     <#
     .SYNOPSIS
-        Cleans up stale temp files created by this script in C:\ProgramData\Temp and user temp directories
+        Cleans up stale temp files and abandoned per-session directories created by either
+        the detect or remediate script in C:\ProgramData\Temp and user temp directories.
+    .DESCRIPTION
+        v9.50: regex unified with detect.ps1 so each script's startup cleanup catches the
+        OTHER script's leftovers too (previously remediate didn't know about UserDetection_*
+        files, and detect didn't know about availableUpgrades-dialog-* per-session
+        directories - so cross-leftovers accumulated). Also scans DIRECTORIES, not just files,
+        so abandoned dialog-host per-session subdirectories (introduced in v9.43) get cleaned
+        if Stop-DialogHost couldn't tear them down.
     #>
-    # 10-minute cutoff: these files are only needed while a dialog is active (a few minutes).
-    # Anything older is leftover from a previous run and safe to remove, including files days/months old.
+    # 10-minute cutoff: these files are only needed while a dialog/prompt is active (a few
+    # minutes at most). Anything older is leftover from a previous run and safe to remove.
     $cutoff = (Get-Date).AddMinutes(-10)
     $removed = 0
 
-    # Match all file patterns this script creates (temp files, scripts, VBS launchers)
-    # Using regex instead of -Filter because Windows filter matching is unreliable with multiple dots (e.g. .heartbeat.error)
-    $nameRegex = '^(UserRemediation_\d+\.|UserRemediationHeartbeat_|availableUpgrades-remediate_\d+\.ps1|availableUpgrades-dialog-|MandatoryPrompt_.*_(Response|Progress)|Show-MandatoryPrompt_|DeferralPrompt_.*_Response|Show-DeferralPrompt_|UserPrompt_.*_Response|Show-UserPrompt_|UpgradeProgress_.*_(Signal|Status)|Show-UpgradeProgress_|CompletionNotification_|Show-CompletionNotification_|SkipPrompt_.*_Response|Show-SkipPrompt_|UserContext_Debug|UserContext_Heartbeat_Error_|HiddenLaunch_\d+\.vbs$)'
+    # Combined regex covers everything either script creates. Order is for readability:
+    #   - Result/heartbeat JSON files       (UserDetection_, UserRemediation_, UserRemediationHeartbeat_)
+    #   - Script copies                     (availableUpgrades-detect_, availableUpgrades-remediate_)
+    #   - Persistent dialog host artifacts  (availableUpgrades-dialog-*)
+    #   - Per-prompt response/script files  (MandatoryPrompt_, DeferralPrompt_, etc.)
+    #   - VBS launchers + misc debug logs
+    $nameRegex = '^(UserDetection_(Fallback_)?\d+\.json$|UserRemediation_\d+\.|UserRemediationHeartbeat_|availableUpgrades-detect_\d+\.ps1|availableUpgrades-remediate_\d+\.ps1|availableUpgrades-dialog-|MandatoryPrompt_.*_(Response|Progress)|Show-MandatoryPrompt_|DeferralPrompt_.*_Response|Show-DeferralPrompt_|UserPrompt_.*_Response|Show-UserPrompt_|UpgradeProgress_.*_(Signal|Status)|Show-UpgradeProgress_|CompletionNotification_|Show-CompletionNotification_|SkipPrompt_.*_Response|Show-SkipPrompt_|UserContext_Debug|UserContext_Heartbeat_Error_|HiddenLaunch_\d+\.vbs$)'
 
-    # Scan C:\ProgramData\Temp
-    $tempPath = "C:\ProgramData\Temp"
-    if (Test-Path $tempPath) {
-        Get-ChildItem -Path $tempPath -File -ErrorAction SilentlyContinue |
+    $scanLocation = {
+        param([string]$path)
+        if (-not (Test-Path $path)) { return 0 }
+        $local:n = 0
+        # Files
+        Get-ChildItem -Path $path -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
             ForEach-Object {
                 Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-                $removed++
+                $local:n++
             }
+        # Directories - currently only the dialog host's per-session subdir matches our patterns.
+        # Remove-Item -Recurse is required because the directory has files inside.
+        Get-ChildItem -Path $path -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
+            ForEach-Object {
+                Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                $local:n++
+            }
+        return $local:n
     }
+
+    $removed += & $scanLocation "C:\ProgramData\Temp"
 
     # Scan user temp directories for VBS launchers and dialog script/response files
     try {
@@ -6651,19 +6677,14 @@ function Remove-OldTempFiles {
             Where-Object { Test-Path $_ }
 
         foreach ($userTemp in $userTempPaths) {
-            Get-ChildItem -Path $userTemp -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
-                ForEach-Object {
-                    Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-                    $removed++
-                }
+            $removed += & $scanLocation $userTemp
         }
     } catch {
         # Don't let user temp cleanup failures block the main script
     }
 
     if ($removed -gt 0) {
-        Write-Log -Message "Cleaned up $removed old temp files"
+        Write-Log -Message "Cleaned up $removed old temp files/directories"
     }
 }
 
