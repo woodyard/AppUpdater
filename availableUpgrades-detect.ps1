@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.59
-    Tag: 89
+    Version: 5.60
+    Tag: 90
     
     Version History:
     1.0 - Initial version
@@ -97,6 +97,7 @@
     5.48 - TUNE: $LogDate dropped its _HH-mm component, so all detection runs on the same calendar day now append to a single DetectAvailableUpgrades-DD-MM-YY.log file instead of producing a new file per session. Mirrors remediate.ps1 v9.35. Remove-OldLogs's 1-month retention is unchanged.
     5.49 - FIX: WingetUpgradeManager deferral reads were going through PSDrive HKLM:\SOFTWARE\WingetUpgradeManager\..., which the WoW64 redirector rewrites to WOW6432Node for 32-bit PowerShell hosts. Combined with remediate.ps1 also being WoW64-redirected when run from Intune (32-bit default), data was effectively at WOW6432Node but invisible to 64-bit ad-hoc inspection. Switched the one deferral-read site here to $Script:WumRegRoot (pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager; later renamed to $Script:AppRegRoot in v5.50) so detect.ps1 and remediate.ps1 v9.39 always agree on where deferral state lives regardless of host bitness.
     5.50 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot. Mirrors remediate.ps1 v9.40. No automatic migration - existing state at the old path is orphaned.
+    5.60 - FIX: Get-AppInstalledScope now adds a SYSTEM-side visibility probe AFTER it resolves to "machine". An app can be correctly machine-scoped (Program Files install, real HKLM Uninstall entry) yet still un-upgradeable from SYSTEM context, because winget's catalog-Id <-> installed-binary binding lives in per-user LocalState (%LOCALAPPDATA%\Packages\Microsoft.DesktopAppInstaller_*). SYSTEM's LocalState is empty for apps the user installed via `winget install`, so `winget list --id X --exact` from SYSTEM returns nothing even when the app is genuinely installed (Git.Git is the canonical case - confirmed by PsExec -s test). Probe: when SYSTEM detects "machine", run `winget list --id X --exact --source winget` from SYSTEM. If the output doesn't contain the AppID, downgrade to "unknown" - that routes through remediate.ps1 v9.49's user-context retry handoff, where the user's own winget LocalState has the binding. Decision-by tag in the log now appends "+invisible-to-system" so the probe firing is traceable. Cost: one extra ~1-2s winget call per machine-detected app, only paid in SYSTEM-context detection. Pairs with remediate.ps1 v9.54.
     5.59 - FIX: When SYSTEM's winget upgrade returned 0 apps the script exited immediately without ever scheduling the user-context detection task. Per-user installs (Claude desktop, OhMyPosh, MSIX/Store apps, Bicep) are often invisible to SYSTEM's profile, so SYSTEM seeing zero doesn't mean "nothing to upgrade" - it can mean "nothing visible to me". The early-exit hid user-only upgrades from every cycle that happened to have no machine-scope work. Gate widened: if SYSTEM is the runner AND an interactive session is present AND we're not the user-detection task ourselves, the flow now enters the main branch (which already merges SYSTEM + user-context listings and handles 0 system apps gracefully). The user-context task runs, returns whatever per-user apps it sees, and those become the work list. If user-context also returns 0, the existing 0-apps exit path fires as before.
     5.58 - FIX: Get-AppInstalledScope now applies layered fallback heuristics when the uninstall-registry walk returns "unknown". Real installs are always machine or user; "unknown" is a script limitation, not a real state. Three fallbacks fire in sequence: (A) MSIX/AppX suffix in the AppID (Microsoft Store packages, MSIX-flavoured entries) -> user, since Store-backed apps are by definition per-user; (B) walk the interactive user's %LOCALAPPDATA%\Programs and %LOCALAPPDATA% for a directory whose name matches any of the search terms - catches per-user installs that skip ARP entirely (Bicep ships as a single .exe in a user dir; Claude installs to %LOCALAPPDATA%\Programs\claude-desktop\); (C) walk %PROGRAMFILES% and %PROGRAMFILES(x86)% for the rare machine install that didn't write an uninstall key. From SYSTEM context we resolve the interactive user's profile path via Get-InteractiveUser so the per-user walk targets the right user. After these fallbacks, "unknown" should be a very rare outcome.
     5.57 - REFACTOR: v5.56's failure-data interpretation was a separate inline implementation - it happened to produce the same answers as remediate.ps1's Get-VersionFailureData, but the user correctly pointed out that the two scripts should literally share interpretation logic so they cannot drift apart. Get-VersionFailureData copied verbatim from remediate.ps1 into detect.ps1 (alongside the existing AppReg* helpers), and detect's per-app check now calls it directly. Same field names, same comparison semantics, same default-on-version-mismatch return shape. No behaviour change vs v5.56 - just structural alignment so any future change to failure-tracking semantics in remediate is automatically reflected in detect by porting the same one function.
@@ -1098,6 +1099,40 @@ function Get-AppInstalledScope {
                 }
             } catch {
                 Write-Log "Scope detection: machine-fs-walk error for $AppID : $($_.Exception.Message)" | Out-Null
+            }
+        }
+
+        # v5.60: SYSTEM-side visibility probe. The script can correctly detect that an app
+        # is machine-scoped (real Program Files install path, real HKLM Uninstall key) but
+        # SYSTEM-context winget still can't action the upgrade - because winget's package
+        # tracking (binding catalog Id <-> installed binary) lives in per-user LocalState
+        # under %LOCALAPPDATA%\Packages\Microsoft.DesktopAppInstaller_*. SYSTEM has its own
+        # empty LocalState. `winget list --id <X> --exact` from SYSTEM returns nothing for
+        # apps the user installed via winget into Program Files (Git.Git is the canonical
+        # example) because the registry-only fallback matcher can't connect the ARP
+        # DisplayName to the catalog Id.
+        # Probe: if we detected "machine" and we're running as SYSTEM, ask SYSTEM-winget
+        # whether IT can see this package. If not, downgrade to "unknown" so remediate's
+        # v9.49 user-context retry handoff fires - the user's winget LocalState has the
+        # binding even when SYSTEM's doesn't.
+        if ($resolvedScope -eq "machine" -and (Test-RunningAsSystem) -and $WingetPath) {
+            try {
+                $probeExe = Join-Path $WingetPath "winget.exe"
+                if (Test-Path $probeExe) {
+                    Push-Location $WingetPath
+                    try {
+                        $probeOut = & $probeExe list --id $AppID --exact --source winget --accept-source-agreements 2>&1 | Out-String
+                    } finally {
+                        Pop-Location
+                    }
+                    if (-not ($probeOut -match [regex]::Escape($AppID))) {
+                        Write-Log "Scope detection $AppID : SYSTEM-side winget can't see this package despite registry match - downgrading to 'unknown' so user-context retry fires" | Out-Null
+                        $resolvedScope = "unknown"
+                        $decisionBy = "$decisionBy+invisible-to-system"
+                    }
+                }
+            } catch {
+                Write-Log "Scope detection $AppID : visibility probe error (non-fatal): $($_.Exception.Message)" | Out-Null
             }
         }
 

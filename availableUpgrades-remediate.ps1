@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.53
- Tag: 53
+ Version: 9.54
+ Tag: 54
     
     Version History:
     1.0 - Initial version
@@ -105,6 +105,7 @@
     9.38 - FIX: When the per-app loop ended without processing any apps (e.g. the only app in the task file was actively deferred and got skipped), the script still sent a `complete` command to the dialog host. The host briefly rendered "Updates complete - 0 apps processed" with its 3-second auto-hide, but Stop-DialogHost fired immediately after and force-killed the host process within ~1 s, producing a visible sub-second flash of the completion panel even though the run was a no-op. Now the final `complete` command is gated on $count -gt 0 so a no-op run leaves the host hidden through teardown.
     9.39 - FIX: WingetUpgradeManager registry state (Deferrals, Failures, ReleaseCache) was being read/written via PSDrive paths like HKLM:\SOFTWARE\WingetUpgradeManager\..., which the Windows WoW64 redirector silently rewrites to HKLM:\SOFTWARE\WOW6432Node\... when the host process is 32-bit. Intune Remediations default to a 32-bit PowerShell host, so all script writes went to WOW6432Node; anything reading from a 64-bit context (manual PowerShell prompt, ad-hoc tooling) saw an empty/stale view. A user with an active Notepad++ deferral was invisible to a 64-bit Get-ChildItem on the non-WOW path while clearly visible at the WOW6432Node path. Fix: introduced $Script:WumRegRoot pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager and routed all 12 call sites through it (later renamed to $Script:AppRegRoot in v9.40). Both 32-bit and 64-bit PowerShell hosts now hit the same physical hive. Chose WOW6432Node-pinned (not 64-bit-pinned via .NET OpenBaseKey) because existing data is already at WOW6432Node from prior 32-bit Intune runs, so no migration is required; the trade-off is that orphaned entries written to the native HKLM:\SOFTWARE\WingetUpgradeManager by old 64-bit runs become invisible to the script (acceptable: those entries were already stale or expired).
     9.40 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot to match. No automatic migration of state from the old WingetUpgradeManager path - existing deferrals, failures, and release cache entries become orphaned. On the next run the script sees an empty state, so users will be re-prompted for any apps with pending updates instead of having their previously-set deferrals honored. Manual cleanup of the orphaned old key is up to the operator: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager' -Recurse -Force.
+    9.54 - FIX: Schedule-UserContextRemediation's task principal RunLevel bumped from Limited to Highest. Some upgrades require admin to write the target install location (Git.Git lives in C:\Program Files\Git\ - the user's winget LocalState knows the catalog binding so the upgrade can be identified, but the install itself needs elevation). At RunLevel Limited the v9.49 user-context retry handoff ran non-elevated and silently failed these machine-scope-needing upgrades. At RunLevel Highest, admin users get an elevated scheduled-task token automatically (no UAC prompt - scheduled tasks at Highest auto-elevate for members of the local Administrators group); non-admin users see no regression (Highest is "max of what the user has", which is still Limited for them). Pairs with detect.ps1 v5.60.
     9.53 - UX: Session-start banner written at the top of each run. Three `=`-bordered lines so a new run is obvious when scrolling a per-day log file that contains many sessions. Banner reads the script's own Version field from the .NOTES block at runtime so it stays in sync without a separate constant to maintain. Format: "===== RemediateAvailableUpgrades v9.53  PID 12345  SYSTEM context  on COMPUTERNAME". Context label distinguishes SYSTEM / user (admin) / user / user-context (handoff).
     9.52 - FIX: Set-SystemSleepBlocked still failed with "Cannot convert value -2147483647 to type System.UInt32" despite v9.48's [uint32] cast. Root cause: PowerShell 5.1 (which is what Intune Remediations run) parses hex literals like 0x80000001 as SIGNED Int32 - the high bit is treated as the sign bit, so the literal evaluates to -2147483647 BEFORE the [uint32] cast even runs. The cast then rejects the negative value. v9.48's cast was a no-op for the same reason. Switched the literals to decimal (2147483648 = 0x80000000, 2147483649 = 0x80000001). PowerShell promotes bare decimals that exceed [Int32]::MaxValue straight to Int64 with no sign trickery, so [uint32]<positive Int64> succeeds and SetThreadExecutionState gets the value it expected all along.
     9.51 - TUNE: Remove-OldTempFiles cutoff bumped from 10 minutes to 60 minutes. The previous 10-minute window was set assuming all script-created temp files were tied to short-lived dialogs and prompts, but a remediation run that processes several large packages (Office, Visual Studio, multi-gigabyte downloads with retries) can easily stay running for 30+ minutes. During that time its own in-flight files would match the cleanup regex and could be deleted out from under it. 60 minutes is comfortably longer than any legitimate single run and still recent enough to catch real orphans on the next startup.
@@ -6142,11 +6143,20 @@ function Schedule-UserContextRemediation {
             $userFormats = @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")
             $logonTypes = @("Interactive", "S4U")
             
+            # v9.54: bump RunLevel from Limited to Highest. Some upgrades require admin
+            # privileges to land at machine scope (e.g. Git.Git which lives in
+            # C:\Program Files\ - the user's winget LocalState binds catalog Id to install,
+            # but the install itself needs elevation to overwrite Program Files\Git\). With
+            # RunLevel Limited the scheduled task ran with a stripped-down user token and
+            # silently failed those upgrades; for admin users Highest runs elevated (no UAC
+            # prompt - scheduled tasks at Highest auto-elevate for members of the local
+            # Administrators group). For non-admin users Highest is still their effective
+            # max, so no regression.
             foreach ($userFormat in $userFormats) {
                 foreach ($logonType in $logonTypes) {
                     try {
-                        $principal = New-ScheduledTaskPrincipal -UserId $userFormat -LogonType $logonType -RunLevel Limited
-                        Write-Log "Successfully created principal with: $userFormat ($logonType)" | Out-Null
+                        $principal = New-ScheduledTaskPrincipal -UserId $userFormat -LogonType $logonType -RunLevel Highest
+                        Write-Log "Successfully created principal with: $userFormat ($logonType, RunLevel Highest)" | Out-Null
                         break
                     } catch {
                         Write-Log "Failed with format '$userFormat' ($logonType): $($_.Exception.Message)" | Out-Null
