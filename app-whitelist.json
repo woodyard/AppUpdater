@@ -424,6 +424,7 @@
             "AppID": "Anthropic.Claude",
             "FriendlyName": "Claude",
             "Category": "AI",
+            "Disabled": true,
             "BlockingProcess": "Claude",
             "ForcedUpgradeMessage": "Claude updates can no longer be deferred."
         },
