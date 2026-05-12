@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.36
- Tag: 36
+ Version: 9.37
+ Tag: 37
     
     Version History:
     1.0 - Initial version
@@ -101,6 +101,7 @@
     9.34 - FIX: Two defects observed during the first v9.33 live run. (a) Dialog stayed on screen after "Dialog host stopped" was logged. The graceful "shutdown" command sometimes never lands (host's pump tick can collide with the parent appending to the cmd file, or the final complete+shutdown arrive between pump ticks and the wait-loop exits before they're processed). Stop-DialogHost now records the host PID before tearing down session files, and if the process is still alive after the 5 s graceful window it calls Stop-Process -Force so the WPF window goes away with the process. (b) The window position was set to (workArea.Bottom - 200) before any panel was visible, but SizeToContent="Height" then expanded the window downward as panels filled in, sometimes pushing it below the taskbar (depending on monitor and panel height). Replaced the one-shot position with a Reposition-AnchoredBottomRight helper bound to $window.Add_SizeChanged so the window stays anchored 20 px above the taskbar regardless of which panel is showing.
     9.35 - TUNE: $LogDate dropped its _HH-mm component, so all remediation runs on the same calendar day now append to a single RemediateAvailableUpgrades-DD-MM-YY.log file instead of producing a new file per session. Easier to follow a day's activity in one read; Remove-OldLogs's 1-month retention is unchanged so disk growth is bounded.
     9.36 - FIX: When the persistent dialog host dies mid-prompt (Send-DialogCommand returns $null), the blocking-prompt wrappers (Show-MandatoryUpdateDialog, Show-DeferralDialog, Show-VersionSkipDialog) used to silently default to the "proceed with upgrade" outcome. Observed in field on a Notepad++ run with a running blocking process: host went away ~5s after the prompt-deferral command was sent, the deferral wrapper returned Action=Update without surfacing any dialog, and the user's app was force-closed and updated with no opportunity to defer. Wrappers now only commit to the host's reply when a non-null reply comes back; otherwise they fall through to the legacy WPF spawn so the user still sees a dialog. Also: Stop-DialogHost no longer deletes the host's $session.LogFile, so when the host does die its log survives for post-mortem (Remove-OldTempFiles still sweeps it on its normal schedule). And the misleading hardcoded "Starting persistent dialog host (v9.33)" log line was made version-agnostic.
+    9.37 - FIX: Root cause of the dialog host crashing one second into prompt-deferral (and presumably prompt-mandatory, prompt-skip, and the completion auto-hide). The dispatcher timers' Add_Tick script blocks referenced function-local variables ($updateBtn, $btn, $countdown, $hideTimer) defined inside Process-Command's switch arms; by the time the dispatcher fired the timer, Process-Command had returned and those locals were out of scope, resolving to $null. The countdown's `$updateBtn.Content = ...` then threw "The property 'Content' cannot be found on this object", which escaped $app.Run() and exited the host process. Preserved host log from session 25886aac6a4c made this immediately visible (`FATAL: ... Run ... property 'Content' cannot be found`). Fix: every dispatcher closure now reads through $script:blocking (script-scoped) for button + timer references, with Button stored at hashtable creation and timers added once they exist. Each Add_Tick body is also wrapped in try/catch (logs to host log via Write-DH but doesn't crash the dispatcher). Same scope fix applied to complete's hideTimer ($script:hideTimer). Added an Application.DispatcherUnhandledException handler as a final safety net so any future unanticipated exception inside a dispatcher event is logged and swallowed rather than killing the host.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -860,11 +861,18 @@ try {
                 $window.FindName("CompletionBody").Text  = if ($obj.body) { [string]$obj.body } else { "" }
                 Show-Panel "Completion"
                 Ensure-Visible
-                # Auto-hide after 3 s
-                $hideTimer = New-Object System.Windows.Threading.DispatcherTimer
-                $hideTimer.Interval = [TimeSpan]::FromSeconds(3)
-                $hideTimer.Add_Tick({ $hideTimer.Stop(); Ensure-Hidden })
-                $hideTimer.Start()
+                # Auto-hide after 3 s. v9.37: hideTimer must live in script scope, not as a
+                # function-local, or the closure can't find it when the dispatcher fires.
+                if ($script:hideTimer) { try { $script:hideTimer.Stop() } catch {} }
+                $script:hideTimer = New-Object System.Windows.Threading.DispatcherTimer
+                $script:hideTimer.Interval = [TimeSpan]::FromSeconds(3)
+                $script:hideTimer.Add_Tick({
+                    try {
+                        if ($script:hideTimer) { $script:hideTimer.Stop() }
+                        Ensure-Hidden
+                    } catch { Write-DH "Hide-tick error: $($_.Exception.Message)" }
+                })
+                $script:hideTimer.Start()
             }
             "prompt-mandatory" {
                 $timeout = if ($obj.timeoutSec) { [int]$obj.timeoutSec } else { 60 }
@@ -874,22 +882,43 @@ try {
                 $btn = $window.FindName("MandatoryButton"); $btn.Content = "Upgrade ($timeout)"
                 Show-Panel "Mandatory"
                 Ensure-Visible
-                # Countdown
+                # v9.37: stash button + timers in $script:blocking (script scope) so the dispatcher
+                # timer closures still see them after Process-Command returns. The previous code
+                # left $btn and $countdown as function-locals; one second later when the countdown
+                # timer fired, the closure resolved them to $null and `$null.Content = ...` threw
+                # the FATAL that killed $app.Run().
                 $script:blocking = @{
-                    Id = $id; Cmd = $cmd; DefaultResponse = "timeout"; TimeRemaining = $timeout; ButtonOriginal = "Upgrade"
+                    Id = $id
+                    Cmd = $cmd
+                    DefaultResponse = "timeout"
+                    TimeRemaining = $timeout
+                    ButtonOriginal = "Upgrade"
+                    Button = $btn
                 }
                 $countdown = New-Object System.Windows.Threading.DispatcherTimer
                 $countdown.Interval = [TimeSpan]::FromSeconds(1)
                 $countdown.Add_Tick({
-                    if (-not $script:blocking) { $countdown.Stop(); return }
-                    $script:blocking.TimeRemaining--
-                    $btn.Content = "$($script:blocking.ButtonOriginal) ($($script:blocking.TimeRemaining))"
-                    if ($script:blocking.TimeRemaining -le 0) { $countdown.Stop() }
+                    try {
+                        if (-not $script:blocking) { return }
+                        $script:blocking.TimeRemaining--
+                        if ($script:blocking.Button) {
+                            $script:blocking.Button.Content = "$($script:blocking.ButtonOriginal) ($($script:blocking.TimeRemaining))"
+                        }
+                        if ($script:blocking.TimeRemaining -le 0 -and $script:blocking.CountdownTimer) {
+                            $script:blocking.CountdownTimer.Stop()
+                        }
+                    } catch { Write-DH "Mandatory countdown tick error: $($_.Exception.Message)" }
                 })
                 $countdown.Start()
                 $timeoutTimer = New-Object System.Windows.Threading.DispatcherTimer
                 $timeoutTimer.Interval = [TimeSpan]::FromSeconds($timeout)
-                $timeoutTimer.Add_Tick({ $timeoutTimer.Stop(); End-Blocking "timeout"; Ensure-Hidden })
+                $timeoutTimer.Add_Tick({
+                    try {
+                        if ($script:blocking -and $script:blocking.TimeoutTimer) { $script:blocking.TimeoutTimer.Stop() }
+                        End-Blocking "timeout"
+                        Ensure-Hidden
+                    } catch { Write-DH "Mandatory timeout tick error: $($_.Exception.Message)" }
+                })
                 $timeoutTimer.Start()
                 $script:blocking.TimeoutTimer = $timeoutTimer
                 $script:blocking.CountdownTimer = $countdown
@@ -905,21 +934,39 @@ try {
                 $updateBtn.Content = "Update Now ($timeout)"
                 Show-Panel "Deferral"
                 Ensure-Visible
+                # v9.37: same scope fix as prompt-mandatory above.
                 $script:blocking = @{
-                    Id = $id; Cmd = $cmd; DefaultResponse = "timeout"; TimeRemaining = $timeout; ButtonOriginal = "Update Now"
+                    Id = $id
+                    Cmd = $cmd
+                    DefaultResponse = "timeout"
+                    TimeRemaining = $timeout
+                    ButtonOriginal = "Update Now"
+                    Button = $updateBtn
                 }
                 $countdown = New-Object System.Windows.Threading.DispatcherTimer
                 $countdown.Interval = [TimeSpan]::FromSeconds(1)
                 $countdown.Add_Tick({
-                    if (-not $script:blocking) { $countdown.Stop(); return }
-                    $script:blocking.TimeRemaining--
-                    $updateBtn.Content = "$($script:blocking.ButtonOriginal) ($($script:blocking.TimeRemaining))"
-                    if ($script:blocking.TimeRemaining -le 0) { $countdown.Stop() }
+                    try {
+                        if (-not $script:blocking) { return }
+                        $script:blocking.TimeRemaining--
+                        if ($script:blocking.Button) {
+                            $script:blocking.Button.Content = "$($script:blocking.ButtonOriginal) ($($script:blocking.TimeRemaining))"
+                        }
+                        if ($script:blocking.TimeRemaining -le 0 -and $script:blocking.CountdownTimer) {
+                            $script:blocking.CountdownTimer.Stop()
+                        }
+                    } catch { Write-DH "Deferral countdown tick error: $($_.Exception.Message)" }
                 })
                 $countdown.Start()
                 $timeoutTimer = New-Object System.Windows.Threading.DispatcherTimer
                 $timeoutTimer.Interval = [TimeSpan]::FromSeconds($timeout)
-                $timeoutTimer.Add_Tick({ $timeoutTimer.Stop(); End-Blocking "timeout"; Ensure-Hidden })
+                $timeoutTimer.Add_Tick({
+                    try {
+                        if ($script:blocking -and $script:blocking.TimeoutTimer) { $script:blocking.TimeoutTimer.Stop() }
+                        End-Blocking "timeout"
+                        Ensure-Hidden
+                    } catch { Write-DH "Deferral timeout tick error: $($_.Exception.Message)" }
+                })
                 $timeoutTimer.Start()
                 $script:blocking.TimeoutTimer = $timeoutTimer
                 $script:blocking.CountdownTimer = $countdown
@@ -930,12 +977,24 @@ try {
                 $window.FindName("SkipBody").Text  = if ($obj.body) { [string]$obj.body } else { "Skip this version, or retry next cycle?" }
                 Show-Panel "Skip"
                 Ensure-Visible
+                # v9.37: skip has no countdown, only a timeout - but the timer still has to live
+                # in script scope so its closure can find $script:blocking.TimeoutTimer to stop.
                 $script:blocking = @{
-                    Id = $id; Cmd = $cmd; DefaultResponse = "timeout"; TimeRemaining = $timeout; ButtonOriginal = ""
+                    Id = $id
+                    Cmd = $cmd
+                    DefaultResponse = "timeout"
+                    TimeRemaining = $timeout
+                    ButtonOriginal = ""
                 }
                 $timeoutTimer = New-Object System.Windows.Threading.DispatcherTimer
                 $timeoutTimer.Interval = [TimeSpan]::FromSeconds($timeout)
-                $timeoutTimer.Add_Tick({ $timeoutTimer.Stop(); End-Blocking "timeout"; Ensure-Hidden })
+                $timeoutTimer.Add_Tick({
+                    try {
+                        if ($script:blocking -and $script:blocking.TimeoutTimer) { $script:blocking.TimeoutTimer.Stop() }
+                        End-Blocking "timeout"
+                        Ensure-Hidden
+                    } catch { Write-DH "Skip timeout tick error: $($_.Exception.Message)" }
+                })
                 $timeoutTimer.Start()
                 $script:blocking.TimeoutTimer = $timeoutTimer
             }
@@ -986,6 +1045,14 @@ try {
     $app = New-Object System.Windows.Application
     $app.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
     $window.Add_Closed({ $app.Shutdown() })
+    # v9.37: catch-all for anything that escapes per-handler try/catches; without this any
+    # unanticipated exception in a dispatcher event propagates out of $app.Run() and the host
+    # process exits, leaving the parent's Send-DialogCommand calls timing out.
+    $app.Add_DispatcherUnhandledException({
+        param($sender, $e)
+        try { Write-DH "Dispatcher unhandled exception: $($e.Exception.Message)" } catch {}
+        $e.Handled = $true
+    })
     $app.Run() | Out-Null
 
 } catch {
