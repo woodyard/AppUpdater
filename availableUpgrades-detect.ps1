@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.49
-    Tag: 79
+    Version: 5.50
+    Tag: 80
     
     Version History:
     1.0 - Initial version
@@ -95,7 +95,8 @@
     5.46 - FIX: Stripped em-dashes/en-dashes (U+2014, U+2013) from the script and saved with a UTF-8 BOM. Without a BOM, PowerShell 5.1 reads the file as Windows-1252 and the multi-byte UTF-8 sequence for an em-dash decodes to bytes 0xE2 0x80 0x94 - byte 0x94 is a right-quote in Windows-1252 which terminated string literals early and broke the parser ("Unexpected token" cascade starting from the Get-CachedWhitelistJSON function added in 5.44). All Unicode dashes replaced with ASCII hyphen-minus.
     5.47 - FIX: Get-CachedWhitelistJSON returned its log line concatenated with the cached body, so $whitelistJSON was "Using cached whitelist (age 0.6 min...) {actual JSON}" and ConvertFrom-Json failed with "Invalid JSON primitive". Root cause: Write-Log pipes through Out-File internally and emits to the success stream under some conditions; every other value-returning function in the script already pipes Write-Log to Out-Null for this reason - I missed it on the new function. All Write-Log calls inside Get-CachedWhitelistJSON now end with `| Out-Null`. Also added a defensive validator: cached and fetched bodies are checked to start with `{` or `[` before being used; corrupt cache files are auto-deleted so the next run re-fetches.
     5.48 - TUNE: $LogDate dropped its _HH-mm component, so all detection runs on the same calendar day now append to a single DetectAvailableUpgrades-DD-MM-YY.log file instead of producing a new file per session. Mirrors remediate.ps1 v9.35. Remove-OldLogs's 1-month retention is unchanged.
-    5.49 - FIX: WingetUpgradeManager deferral reads were going through PSDrive HKLM:\SOFTWARE\WingetUpgradeManager\..., which the WoW64 redirector rewrites to WOW6432Node for 32-bit PowerShell hosts. Combined with remediate.ps1 also being WoW64-redirected when run from Intune (32-bit default), data was effectively at WOW6432Node but invisible to 64-bit ad-hoc inspection. Switched the one deferral-read site here to $Script:WumRegRoot (pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager) so detect.ps1 and remediate.ps1 v9.39 always agree on where deferral state lives regardless of host bitness.
+    5.49 - FIX: WingetUpgradeManager deferral reads were going through PSDrive HKLM:\SOFTWARE\WingetUpgradeManager\..., which the WoW64 redirector rewrites to WOW6432Node for 32-bit PowerShell hosts. Combined with remediate.ps1 also being WoW64-redirected when run from Intune (32-bit default), data was effectively at WOW6432Node but invisible to 64-bit ad-hoc inspection. Switched the one deferral-read site here to $Script:WumRegRoot (pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager; later renamed to $Script:AppRegRoot in v5.50) so detect.ps1 and remediate.ps1 v9.39 always agree on where deferral state lives regardless of host bitness.
+    5.50 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot. Mirrors remediate.ps1 v9.40. No automatic migration - existing state at the old path is orphaned.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -1554,12 +1555,10 @@ $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy # EU format; per-day rollover so all runs in one day share a log file
 $LogFullName = "$LogName-$LogDate.log"
 
-# v5.49: WingetUpgradeManager registry root pinned to WOW6432Node. Mirrors remediate.ps1 v9.39 so
-# 32-bit and 64-bit PowerShell hosts read/write the same physical hive regardless of which one
-# the Intune package runs under. Without this pin, detect.ps1 reading deferral state (the one
-# remaining HKLM:\SOFTWARE\WingetUpgradeManager site at line ~2107) could disagree with writes
-# made by remediate.ps1 under a different bitness.
-$Script:WumRegRoot = 'HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager'
+# v5.50: AppUpdater registry root (renamed from WingetUpgradeManager to match the repo name).
+# Pinned to WOW6432Node for the same bitness-consistency reason described in remediate.ps1.
+# Detect reads deferral state from this root; remediate writes it. Both must agree on the path.
+$Script:AppRegRoot = 'HKLM:\SOFTWARE\WOW6432Node\AppUpdater'
 
 # Capture script path at global scope for use in scheduled tasks
 $Global:CurrentScriptPath = $MyInvocation.MyCommand.Path
@@ -2112,7 +2111,7 @@ if ($LIST -and $LIST.Count -gt 0) {
                     if ($appId -like $okapp.AppID) {
                         # FAST DEFERRAL CHECK - Only check existing registry data (no expensive winget queries)
                         if ($okapp.DeferralEnabled -eq $true) {
-                            $deferralPath = "$Script:WumRegRoot\Deferrals\$appId"
+                            $deferralPath = "$Script:AppRegRoot\Deferrals\$appId"
                             $now = Get-Date
 
                             # Quick check - only look at existing user deadline (no expensive admin deadline calculation)

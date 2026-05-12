@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.39
- Tag: 39
+ Version: 9.40
+ Tag: 40
     
     Version History:
     1.0 - Initial version
@@ -103,7 +103,8 @@
     9.36 - FIX: When the persistent dialog host dies mid-prompt (Send-DialogCommand returns $null), the blocking-prompt wrappers (Show-MandatoryUpdateDialog, Show-DeferralDialog, Show-VersionSkipDialog) used to silently default to the "proceed with upgrade" outcome. Observed in field on a Notepad++ run with a running blocking process: host went away ~5s after the prompt-deferral command was sent, the deferral wrapper returned Action=Update without surfacing any dialog, and the user's app was force-closed and updated with no opportunity to defer. Wrappers now only commit to the host's reply when a non-null reply comes back; otherwise they fall through to the legacy WPF spawn so the user still sees a dialog. Also: Stop-DialogHost no longer deletes the host's $session.LogFile, so when the host does die its log survives for post-mortem (Remove-OldTempFiles still sweeps it on its normal schedule). And the misleading hardcoded "Starting persistent dialog host (v9.33)" log line was made version-agnostic.
     9.37 - FIX: Root cause of the dialog host crashing one second into prompt-deferral (and presumably prompt-mandatory, prompt-skip, and the completion auto-hide). The dispatcher timers' Add_Tick script blocks referenced function-local variables ($updateBtn, $btn, $countdown, $hideTimer) defined inside Process-Command's switch arms; by the time the dispatcher fired the timer, Process-Command had returned and those locals were out of scope, resolving to $null. The countdown's `$updateBtn.Content = ...` then threw "The property 'Content' cannot be found on this object", which escaped $app.Run() and exited the host process. Preserved host log from session 25886aac6a4c made this immediately visible (`FATAL: ... Run ... property 'Content' cannot be found`). Fix: every dispatcher closure now reads through $script:blocking (script-scoped) for button + timer references, with Button stored at hashtable creation and timers added once they exist. Each Add_Tick body is also wrapped in try/catch (logs to host log via Write-DH but doesn't crash the dispatcher). Same scope fix applied to complete's hideTimer ($script:hideTimer). Added an Application.DispatcherUnhandledException handler as a final safety net so any future unanticipated exception inside a dispatcher event is logged and swallowed rather than killing the host.
     9.38 - FIX: When the per-app loop ended without processing any apps (e.g. the only app in the task file was actively deferred and got skipped), the script still sent a `complete` command to the dialog host. The host briefly rendered "Updates complete - 0 apps processed" with its 3-second auto-hide, but Stop-DialogHost fired immediately after and force-killed the host process within ~1 s, producing a visible sub-second flash of the completion panel even though the run was a no-op. Now the final `complete` command is gated on $count -gt 0 so a no-op run leaves the host hidden through teardown.
-    9.39 - FIX: WingetUpgradeManager registry state (Deferrals, Failures, ReleaseCache) was being read/written via PSDrive paths like HKLM:\SOFTWARE\WingetUpgradeManager\..., which the Windows WoW64 redirector silently rewrites to HKLM:\SOFTWARE\WOW6432Node\... when the host process is 32-bit. Intune Remediations default to a 32-bit PowerShell host, so all script writes went to WOW6432Node; anything reading from a 64-bit context (manual PowerShell prompt, ad-hoc tooling) saw an empty/stale view. A user with an active Notepad++ deferral was invisible to a 64-bit Get-ChildItem on the non-WOW path while clearly visible at the WOW6432Node path. Fix: introduced $Script:WumRegRoot pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager and routed all 12 call sites through it. Both 32-bit and 64-bit PowerShell hosts now hit the same physical hive. Chose WOW6432Node-pinned (not 64-bit-pinned via .NET OpenBaseKey) because existing data is already at WOW6432Node from prior 32-bit Intune runs, so no migration is required; the trade-off is that orphaned entries written to the native HKLM:\SOFTWARE\WingetUpgradeManager by old 64-bit runs become invisible to the script (acceptable: those entries were already stale or expired).
+    9.39 - FIX: WingetUpgradeManager registry state (Deferrals, Failures, ReleaseCache) was being read/written via PSDrive paths like HKLM:\SOFTWARE\WingetUpgradeManager\..., which the Windows WoW64 redirector silently rewrites to HKLM:\SOFTWARE\WOW6432Node\... when the host process is 32-bit. Intune Remediations default to a 32-bit PowerShell host, so all script writes went to WOW6432Node; anything reading from a 64-bit context (manual PowerShell prompt, ad-hoc tooling) saw an empty/stale view. A user with an active Notepad++ deferral was invisible to a 64-bit Get-ChildItem on the non-WOW path while clearly visible at the WOW6432Node path. Fix: introduced $Script:WumRegRoot pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager and routed all 12 call sites through it (later renamed to $Script:AppRegRoot in v9.40). Both 32-bit and 64-bit PowerShell hosts now hit the same physical hive. Chose WOW6432Node-pinned (not 64-bit-pinned via .NET OpenBaseKey) because existing data is already at WOW6432Node from prior 32-bit Intune runs, so no migration is required; the trade-off is that orphaned entries written to the native HKLM:\SOFTWARE\WingetUpgradeManager by old 64-bit runs become invisible to the script (acceptable: those entries were already stale or expired).
+    9.40 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot to match. No automatic migration of state from the old WingetUpgradeManager path - existing deferrals, failures, and release cache entries become orphaned. On the next run the script sees an empty state, so users will be re-prompted for any apps with pending updates instead of having their previously-set deferrals honored. Manual cleanup of the orphaned old key is up to the operator: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager' -Recurse -Force.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -4174,8 +4175,8 @@ function Initialize-DeferralRegistry {
     #>
     
     try {
-        $deferralPath = "$Script:WumRegRoot\Deferrals"
-        $cachePath = "$Script:WumRegRoot\ReleaseCache"
+        $deferralPath = "$Script:AppRegRoot\Deferrals"
+        $cachePath = "$Script:AppRegRoot\ReleaseCache"
         
         if (-not (Test-Path $deferralPath)) {
             Write-Log "Creating deferral registry path: $deferralPath" | Out-Null
@@ -4187,7 +4188,7 @@ function Initialize-DeferralRegistry {
             New-Item -Path $cachePath -Force | Out-Null
         }
 
-        $failurePath = "$Script:WumRegRoot\Failures"
+        $failurePath = "$Script:AppRegRoot\Failures"
         if (-not (Test-Path $failurePath)) {
             Write-Log "Creating failure tracking registry path: $failurePath" | Out-Null
             New-Item -Path $failurePath -Force | Out-Null
@@ -4228,7 +4229,7 @@ function Get-AppReleaseDate {
         
         # Create cache key - include version in key if specified
         $cacheKey = if ($Version) { "$AppID-$Version" } else { $AppID }
-        $cachePath = "$Script:WumRegRoot\ReleaseCache"
+        $cachePath = "$Script:AppRegRoot\ReleaseCache"
         
         # Check cache first
         try {
@@ -4340,7 +4341,7 @@ function Get-DeferralStatus {
     try {
         Initialize-DeferralRegistry | Out-Null
         
-        $deferralPath = "$Script:WumRegRoot\Deferrals\$AppID"
+        $deferralPath = "$Script:AppRegRoot\Deferrals\$AppID"
         $now = Get-Date
         
         # Default status - no deferrals
@@ -4506,7 +4507,7 @@ function Set-DeferralChoice {
     try {
         Initialize-DeferralRegistry | Out-Null
         
-        $deferralPath = "$Script:WumRegRoot\Deferrals\$AppID"
+        $deferralPath = "$Script:AppRegRoot\Deferrals\$AppID"
         $now = Get-Date
         
         # Ensure the app-specific path exists
@@ -5501,8 +5502,8 @@ function Clear-ExpiredDeferralData {
     try {
         Write-Log "Starting deferral data cleanup" | Out-Null
         
-        $deferralBasePath = "$Script:WumRegRoot\Deferrals"
-        $cacheBasePath = "$Script:WumRegRoot\ReleaseCache"
+        $deferralBasePath = "$Script:AppRegRoot\Deferrals"
+        $cacheBasePath = "$Script:AppRegRoot\ReleaseCache"
         $now = Get-Date
         $cleanupCount = 0
         
@@ -5583,7 +5584,7 @@ function Get-VersionFailureData {
     )
     $default = @{ FailureCount = 0; IsSkipped = $false }
     try {
-        $path = "$Script:WumRegRoot\Failures\$AppID"
+        $path = "$Script:AppRegRoot\Failures\$AppID"
         if (-not (Test-Path $path)) { return $default }
         $data = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
         if (-not $data -or $data.FailedVersion -ne $Version) { return $default }
@@ -5606,7 +5607,7 @@ function Set-VersionFailure {
         [Parameter(Mandatory)][string]$Version
     )
     try {
-        $path = "$Script:WumRegRoot\Failures\$AppID"
+        $path = "$Script:AppRegRoot\Failures\$AppID"
         if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
         $existing = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
         $count = if ($existing -and $existing.FailedVersion -eq $Version) { [int]$existing.FailureCount + 1 } else { 1 }
@@ -5631,7 +5632,7 @@ function Set-VersionSkipped {
         [Parameter(Mandatory)][string]$Version
     )
     try {
-        $path = "$Script:WumRegRoot\Failures\$AppID"
+        $path = "$Script:AppRegRoot\Failures\$AppID"
         New-Item -Path $path -Force | Out-Null
         Set-ItemProperty -Path $path -Name "FailedVersion" -Value $Version
         Set-ItemProperty -Path $path -Name "Skipped"       -Value "true"
@@ -5649,7 +5650,7 @@ function Clear-VersionFailureData {
     #>
     param([Parameter(Mandatory)][string]$AppID)
     try {
-        $path = "$Script:WumRegRoot\Failures\$AppID"
+        $path = "$Script:AppRegRoot\Failures\$AppID"
         if (Test-Path $path) {
             Remove-Item -Path $path -Force | Out-Null
             Write-Log "Cleared failure tracking data for $AppID" | Out-Null
@@ -6941,13 +6942,13 @@ $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy # EU format; per-day rollover so all runs in one day share a log file
 $LogFullName = "$LogName-$LogDate.log"
 
-# v9.39: WingetUpgradeManager registry root. Pinned to WOW6432Node so a 32-bit PowerShell host
-# (Intune Remediations default) and a 64-bit one both read/write the same physical hive. Without
-# this pin, writes from a 32-bit run got WoW64-redirected into WOW6432Node while writes from a
-# 64-bit run landed in the native view, splitting deferral state across two invisible-to-each-
-# other locations. Existing data already lives at WOW6432Node from 32-bit Intune runs, so this
-# preserves it without a migration step.
-$Script:WumRegRoot = 'HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager'
+# v9.40: AppUpdater registry root (renamed from WingetUpgradeManager to match the repo name).
+# Pinned to WOW6432Node so a 32-bit PowerShell host (Intune Remediations default) and a 64-bit
+# one both read/write the same physical hive. Without this pin, writes from a 32-bit run got
+# WoW64-redirected into WOW6432Node while writes from a 64-bit run landed in the native view,
+# splitting deferral state across two invisible-to-each-other locations. Prior state (under
+# WingetUpgradeManager) is intentionally orphaned on this rename - clear it manually if you care.
+$Script:AppRegRoot = 'HKLM:\SOFTWARE\WOW6432Node\AppUpdater'
 
 # Capture script path at global scope for use in scheduled tasks
 $Global:CurrentScriptPath = $MyInvocation.MyCommand.Path
