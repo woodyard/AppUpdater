@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.56
-    Tag: 86
+    Version: 5.57
+    Tag: 87
     
     Version History:
     1.0 - Initial version
@@ -97,6 +97,7 @@
     5.48 - TUNE: $LogDate dropped its _HH-mm component, so all detection runs on the same calendar day now append to a single DetectAvailableUpgrades-DD-MM-YY.log file instead of producing a new file per session. Mirrors remediate.ps1 v9.35. Remove-OldLogs's 1-month retention is unchanged.
     5.49 - FIX: WingetUpgradeManager deferral reads were going through PSDrive HKLM:\SOFTWARE\WingetUpgradeManager\..., which the WoW64 redirector rewrites to WOW6432Node for 32-bit PowerShell hosts. Combined with remediate.ps1 also being WoW64-redirected when run from Intune (32-bit default), data was effectively at WOW6432Node but invisible to 64-bit ad-hoc inspection. Switched the one deferral-read site here to $Script:WumRegRoot (pinned to HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager; later renamed to $Script:AppRegRoot in v5.50) so detect.ps1 and remediate.ps1 v9.39 always agree on where deferral state lives regardless of host bitness.
     5.50 - RENAME: Registry root renamed from HKLM:\SOFTWARE\WOW6432Node\WingetUpgradeManager to HKLM:\SOFTWARE\WOW6432Node\AppUpdater so the on-disk path matches the GitHub repo name. Variable renamed from $Script:WumRegRoot to $Script:AppRegRoot. Mirrors remediate.ps1 v9.40. No automatic migration - existing state at the old path is orphaned.
+    5.57 - REFACTOR: v5.56's failure-data interpretation was a separate inline implementation - it happened to produce the same answers as remediate.ps1's Get-VersionFailureData, but the user correctly pointed out that the two scripts should literally share interpretation logic so they cannot drift apart. Get-VersionFailureData copied verbatim from remediate.ps1 into detect.ps1 (alongside the existing AppReg* helpers), and detect's per-app check now calls it directly. Same field names, same comparison semantics, same default-on-version-mismatch return shape. No behaviour change vs v5.56 - just structural alignment so any future change to failure-tracking semantics in remediate is automatically reflected in detect by porting the same one function.
     5.56 - FEATURE: Detect now respects per-version dismissals from the remediate.ps1 skip-version dialog, and logs prior-run failure counts informationally. Mechanics: when remediate hits 3 failures for the same version, it shows a "Skip this version?" dialog. Clicking Skip calls Set-VersionSkipped which writes Skipped="true" + FailedVersion=<that version> under Failures\<AppID>. Previously detect ignored this and re-proposed the same dismissed version on every cycle - remediate would retry, fail, show the dialog again, the user would dismiss again, ad infinitum. Now detect reads Failures\<AppID>\Skipped + FailedVersion at the start of the per-app loop (alongside the existing deferral check) and skips apps whose Skipped=true AND FailedVersion matches the current AvailableVersion. A new version makes the dismissal irrelevant, so the cycle naturally resumes when there's actually something different to install. Also added a "Version-dismissed: ..." summary line next to the existing "Deferred: ..." line so the [ScriptTag] block makes the state explicit, and logs prior failure count ("X has failed N time(s) for version V - allowing another attempt") when failures exist but the user hasn't dismissed yet.
     5.55 - UX: Session-start banner written at the top of each run, mirrors remediate.ps1 v9.53. Three `=`-bordered lines that read "===== DetectAvailableUpgrades v5.55  PID 12345  SYSTEM context  on COMPUTERNAME". Version is read from .NOTES at runtime so it stays in sync without a separate constant.
     5.54 - TUNE: Remove-OldTempFiles cutoff bumped from 10 minutes to 60 minutes. Mirrors remediate.ps1 v9.51. The 10-minute window was too short for runs that process large packages - in-flight files for the current run could match the regex and be cleaned up during the run.
@@ -1627,6 +1628,38 @@ function Get-AppRegProperties {
     } finally { $k.Close() }
 }
 
+function Get-VersionFailureData {
+    <#
+    .SYNOPSIS
+        Returns failure count and skip status for a specific app version.
+    .DESCRIPTION
+        v5.57: literal copy of the same function in remediate.ps1 (line ~5698) so detect
+        and remediate interpret Failures\<AppID>\* identically. Comparison semantics:
+          - Skipped: ($data.Skipped -eq "true")          # PowerShell -eq is case-insensitive
+          - Version: $data.FailedVersion -ne $Version    # if mismatch, treat as fresh
+        Returns @{ FailureCount = 0; IsSkipped = $false } if the version doesn't match -
+        so a recorded skip/failure for version X never spuriously affects detection of
+        a different version Y.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Version
+    )
+    $default = @{ FailureCount = 0; IsSkipped = $false }
+    try {
+        $sub = "Failures\$AppID"
+        if (-not (Test-AppRegKey -SubPath $sub)) { return $default }
+        $data = Get-AppRegProperties -SubPath $sub
+        if (-not $data -or $data.FailedVersion -ne $Version) { return $default }
+        return @{
+            FailureCount = [int]($data.FailureCount)
+            IsSkipped    = ($data.Skipped -eq "true")
+        }
+    } catch {
+        return $default
+    }
+}
+
 # Capture script path at global scope for use in scheduled tasks
 $Global:CurrentScriptPath = $MyInvocation.MyCommand.Path
 if ([string]::IsNullOrEmpty($Global:CurrentScriptPath)) {
@@ -2194,38 +2227,28 @@ if ($LIST -and $LIST.Count -gt 0) {
                 $doUpgrade = $false
                 foreach ($okapp in $whitelistConfig) {
                     if ($appId -like $okapp.AppID) {
-                        # v5.56: VERSION-DISMISSED CHECK - if remediate.ps1 hit the per-version
-                        # failure ceiling (3 retries) and the user clicked "Skip this version"
-                        # on the resulting dialog, Set-VersionSkipped recorded that choice in
-                        # Failures\<AppID> with Skipped=true and FailedVersion=<that version>.
-                        # Re-detecting the same version would just re-add the task file entry,
-                        # remediate would retry, fail, show the skip dialog again, the user
-                        # would dismiss again - infinite loop. Respect the dismissal until a
-                        # different version becomes available. Also surface failure history in
-                        # the log so a stuck app is visible without trawling remediate logs.
+                        # v5.56/v5.57: respect per-version dismissals + surface failure counts.
+                        # Reads Failures\<AppID>\{Skipped,FailedVersion,FailureCount} via
+                        # Get-VersionFailureData - the exact same function (and therefore the
+                        # exact same comparison semantics) remediate.ps1 uses internally. So
+                        # whatever remediate considers "this version is dismissed" detect now
+                        # considers the same way - no risk of the two scripts disagreeing about
+                        # whether to act on an entry.
                         $availVersion = $null
                         try { $availVersion = $app.AvailableVersion } catch {}
                         if ($availVersion) {
-                            $failuresSub = "Failures\$appId"
-                            if (Test-AppRegKey -SubPath $failuresSub) {
-                                try {
-                                    $failData = Get-AppRegProperties -SubPath $failuresSub
-                                    if ($failData) {
-                                        $skippedFlag = "$($failData.Skipped)".ToLower() -eq 'true'
-                                        $versionMatches = ($failData.FailedVersion -eq $availVersion)
-                                        if ($skippedFlag -and $versionMatches) {
-                                            $failCount = if ($failData.FailureCount) { [int]$failData.FailureCount } else { 0 }
-                                            $dismissedApps += "$($okapp.AppID) v$availVersion (dismissed after $failCount failure(s))"
-                                            Write-Log -Message "Skipping $($okapp.AppID) - user dismissed version $availVersion after $failCount failure(s)"
-                                            continue
-                                        } elseif ($versionMatches -and $failData.FailureCount -and [int]$failData.FailureCount -gt 0) {
-                                            Write-Log -Message "$($okapp.AppID) has failed $($failData.FailureCount) time(s) for version $availVersion - allowing another attempt"
-                                        }
-                                    }
-                                } catch {
-                                    Write-Log -Message "Error reading failure data for $appId : $($_.Exception.Message)"
-                                    # On error, allow detection to proceed
+                            try {
+                                $failData = Get-VersionFailureData -AppID $appId -Version $availVersion
+                                if ($failData.IsSkipped) {
+                                    $dismissedApps += "$($okapp.AppID) v$availVersion (dismissed after $($failData.FailureCount) failure(s))"
+                                    Write-Log -Message "Skipping $($okapp.AppID) - user dismissed version $availVersion after $($failData.FailureCount) failure(s)"
+                                    continue
+                                } elseif ($failData.FailureCount -gt 0) {
+                                    Write-Log -Message "$($okapp.AppID) has failed $($failData.FailureCount) time(s) for version $availVersion - allowing another attempt"
                                 }
+                            } catch {
+                                Write-Log -Message "Error reading failure data for $appId : $($_.Exception.Message)"
+                                # On error, allow detection to proceed
                             }
                         }
 
