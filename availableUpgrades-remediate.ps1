@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.35
- Tag: 35
+ Version: 9.36
+ Tag: 36
     
     Version History:
     1.0 - Initial version
@@ -100,6 +100,7 @@
     9.33 - FEATURE (wire-up): Routes every dialog through the persistent dialog host introduced in v9.32; legacy per-app scheduled-task spawn is retained as fallback when the host is unavailable. New script parameter -DialogSessionId lets user-context attach to the SYSTEM-owned session via Connect-DialogSession; Schedule-UserContextRemediation appends -DialogSessionId to the user-context launch args only when Test-DialogHostAlive. Start-DialogHost runs once at the top of the main remediation block in SYSTEM context; Stop-DialogHost runs on both exit paths gated on (-not $UserRemediationOnly) so user-context never tears down a host SYSTEM started. Wrappers added at the public entry points: Show-CompletionNotification -> complete; Show-UpgradeProgressNotification -> show-progress (returns $null on host path so legacy signal-file callers no-op); Write-InfoDialogStatus -> status (routes to host whenever alive, independent of SignalFilePath); Show-MandatoryUpdateDialog -> prompt-mandatory ("upgrade"/"timeout" both mean proceed, returns "Continue"); Show-DeferralDialog -> prompt-mandatory for ForceUpdate, prompt-deferral otherwise; Show-VersionSkipDialog -> prompt-skip. Main loop emits a `transition` command between successive apps using $Script:DialogPrevApp; after the foreach loop ends, a final `complete` reports total apps processed + overall success/failure, triggering the host's 3 s auto-hide. Show-ProcessCloseDialog and the general-purpose Yes/No prompts (Show-UserDialog, Invoke-SystemUserPrompt, Show-ModernDialog, Show-DirectUserDialog) are intentionally left on the legacy path - their UX doesn't match any of the six host panels yet.
     9.34 - FIX: Two defects observed during the first v9.33 live run. (a) Dialog stayed on screen after "Dialog host stopped" was logged. The graceful "shutdown" command sometimes never lands (host's pump tick can collide with the parent appending to the cmd file, or the final complete+shutdown arrive between pump ticks and the wait-loop exits before they're processed). Stop-DialogHost now records the host PID before tearing down session files, and if the process is still alive after the 5 s graceful window it calls Stop-Process -Force so the WPF window goes away with the process. (b) The window position was set to (workArea.Bottom - 200) before any panel was visible, but SizeToContent="Height" then expanded the window downward as panels filled in, sometimes pushing it below the taskbar (depending on monitor and panel height). Replaced the one-shot position with a Reposition-AnchoredBottomRight helper bound to $window.Add_SizeChanged so the window stays anchored 20 px above the taskbar regardless of which panel is showing.
     9.35 - TUNE: $LogDate dropped its _HH-mm component, so all remediation runs on the same calendar day now append to a single RemediateAvailableUpgrades-DD-MM-YY.log file instead of producing a new file per session. Easier to follow a day's activity in one read; Remove-OldLogs's 1-month retention is unchanged so disk growth is bounded.
+    9.36 - FIX: When the persistent dialog host dies mid-prompt (Send-DialogCommand returns $null), the blocking-prompt wrappers (Show-MandatoryUpdateDialog, Show-DeferralDialog, Show-VersionSkipDialog) used to silently default to the "proceed with upgrade" outcome. Observed in field on a Notepad++ run with a running blocking process: host went away ~5s after the prompt-deferral command was sent, the deferral wrapper returned Action=Update without surfacing any dialog, and the user's app was force-closed and updated with no opportunity to defer. Wrappers now only commit to the host's reply when a non-null reply comes back; otherwise they fall through to the legacy WPF spawn so the user still sees a dialog. Also: Stop-DialogHost no longer deletes the host's $session.LogFile, so when the host does die its log survives for post-mortem (Remove-OldTempFiles still sweeps it on its normal schedule). And the misleading hardcoded "Starting persistent dialog host (v9.33)" log line was made version-agnostic.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -559,11 +560,17 @@ function Stop-DialogHost {
         if ($session.TaskName) {
             Unregister-ScheduledTask -TaskName $session.TaskName -Confirm:$false -ErrorAction SilentlyContinue
         }
-        foreach ($p in @($session.CmdFile, $session.CursorFile, $session.HeartbeatFile, $session.PidFile, $session.LogFile, $session.ScriptFile, $session.VbsPath)) {
+        # v9.36: deliberately preserve $session.LogFile so we can post-mortem any host crash.
+        # Remove-OldTempFiles will sweep these on its normal schedule along with anything else
+        # matching availableUpgrades-dialog-*.
+        foreach ($p in @($session.CmdFile, $session.CursorFile, $session.HeartbeatFile, $session.PidFile, $session.ScriptFile, $session.VbsPath)) {
             if ($p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
         }
         if ($session.ReplyDir -and (Test-Path $session.ReplyDir)) {
             Remove-Item $session.ReplyDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if ($session.LogFile -and (Test-Path $session.LogFile)) {
+            Write-Log "Dialog host log preserved at $($session.LogFile)" | Out-Null
         }
         Write-Log "Dialog host stopped (session $($session.SessionId))" | Out-Null
     } catch {
@@ -3448,6 +3455,9 @@ function Show-MandatoryUpdateDialog {
 
     try {
         # v9.33: persistent dialog host path
+        # v9.36: only commit to "Continue" when we get a valid reply. If the host dies mid-prompt
+        # (Send-DialogCommand returns $null), fall through to the legacy spawn below so the user
+        # still gets a visible prompt rather than a silent proceed.
         if (Test-DialogHostAlive) {
             $parts = $Question -split '\|', 2
             $versionInfo = if ($parts.Count -ge 1) { $parts[0] } else { "" }
@@ -3458,8 +3468,12 @@ function Show-MandatoryUpdateDialog {
                 body = $bodyText
                 timeoutSec = $TimeoutSeconds
             } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
-            # "upgrade" (clicked), "timeout" (waited it out), $null (host died) -> all mean proceed
-            return "Continue"
+            if ($reply) {
+                # "upgrade" (clicked) or "timeout" (waited it out) -> both mean proceed
+                return "Continue"
+            }
+            Write-Log "Show-MandatoryUpdateDialog: dialog host died mid-prompt - falling back to legacy spawn" | Out-Null
+            # fall through
         }
 
         if (Test-RunningAsSystem) {
@@ -4509,6 +4523,9 @@ function Show-DeferralDialog {
         $hasBlockingProcess = -not [string]::IsNullOrEmpty($ProcessName)
 
         # v9.33: persistent dialog host path
+        # v9.36: only commit to host-only behaviour when we get a valid reply. If the host dies
+        # mid-prompt (Send-DialogCommand returns $null), fall through to the legacy WPF dialog
+        # below so the user still gets a visible prompt instead of a silent default action.
         if (Test-DialogHostAlive) {
             $versionText = if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
                 "$displayName $CurrentVersion -> $AvailableVersion"
@@ -4517,33 +4534,36 @@ function Show-DeferralDialog {
             }
             if ($DeferralStatus.ForceUpdate) {
                 # Forced update - route as prompt-mandatory; both "upgrade" and "timeout" mean proceed
-                Send-DialogCommand -Cmd "prompt-mandatory" -Payload @{
+                $reply = Send-DialogCommand -Cmd "prompt-mandatory" -Payload @{
                     title = "Required Update: $displayName"
                     versionInfo = $versionText
                     body = if ($hasBlockingProcess) { "$displayName must be closed to install this update." } else { [string]$DeferralStatus.Message }
                     timeoutSec = $TimeoutSeconds
-                } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30) | Out-Null
-                return @{
-                    Action = "Update"
-                    DeferralDays = 0
-                    CloseProcess = $hasBlockingProcess
+                } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
+                if ($reply) {
+                    return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $hasBlockingProcess }
                 }
+                Write-Log "Show-DeferralDialog: dialog host died mid prompt-mandatory - falling back to legacy spawn" | Out-Null
+            } else {
+                # Deferrable - route as prompt-deferral
+                $daysLeft = if ($DeferralStatus.PSObject.Properties['DaysRemaining']) { [int]$DeferralStatus.DaysRemaining } elseif ($DeferralStatus.PSObject.Properties['MaxDeferralDays']) { [int]$DeferralStatus.MaxDeferralDays } else { $null }
+                $reply = Send-DialogCommand -Cmd "prompt-deferral" -Payload @{
+                    title = "Update Available: $displayName"
+                    body = $versionText + "`n`n" + [string]$DeferralStatus.Message
+                    daysLeft = $daysLeft
+                    canDefer = ($DeferralStatus.CanDefer -eq $true)
+                    timeoutSec = $TimeoutSeconds
+                } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
+                if ($reply -and $reply.response) {
+                    $choice = [string]$reply.response
+                    if ($choice -eq "defer") {
+                        return @{ Action = "Defer"; DeferralDays = 1; CloseProcess = $false }
+                    }
+                    return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $hasBlockingProcess }
+                }
+                Write-Log "Show-DeferralDialog: dialog host died mid prompt-deferral - falling back to legacy spawn" | Out-Null
             }
-            # Deferrable - route as prompt-deferral
-            $daysLeft = if ($DeferralStatus.PSObject.Properties['DaysRemaining']) { [int]$DeferralStatus.DaysRemaining } elseif ($DeferralStatus.PSObject.Properties['MaxDeferralDays']) { [int]$DeferralStatus.MaxDeferralDays } else { $null }
-            $reply = Send-DialogCommand -Cmd "prompt-deferral" -Payload @{
-                title = "Update Available: $displayName"
-                body = $versionText + "`n`n" + [string]$DeferralStatus.Message
-                daysLeft = $daysLeft
-                canDefer = ($DeferralStatus.CanDefer -eq $true)
-                timeoutSec = $TimeoutSeconds
-            } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
-            $choice = if ($reply -and $reply.response) { [string]$reply.response } else { "timeout" }
-            if ($choice -eq "defer") {
-                return @{ Action = "Defer"; DeferralDays = 1; CloseProcess = $false }
-            }
-            # "update" or "timeout" (default to update, matches legacy fallback) or host died
-            return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $hasBlockingProcess }
+            # fall through to legacy WPF dispatcher below
         }
         
         # Build dialog content
@@ -5590,6 +5610,8 @@ function Show-VersionSkipDialog {
         $displayName = if ($FriendlyName) { $FriendlyName } else { $AppName }
 
         # v9.33: persistent dialog host path
+        # v9.36: only commit to the host's reply when we get one. If the host dies mid-prompt,
+        # fall through to legacy spawn so the user still sees a Skip/Retry choice.
         if (Test-DialogHostAlive) {
             $reply = Send-DialogCommand -Cmd "prompt-skip" -Payload @{
                 app = $displayName
@@ -5597,8 +5619,11 @@ function Show-VersionSkipDialog {
                 body = "Version $Version has failed $FailureCount times. Skip this version, or retry next cycle?"
                 timeoutSec = $TimeoutSeconds
             } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
-            $choice = if ($reply -and $reply.response) { [string]$reply.response } else { "timeout" }
-            return ($choice -eq "skip")
+            if ($reply -and $reply.response) {
+                return ([string]$reply.response -eq "skip")
+            }
+            Write-Log "Show-VersionSkipDialog: dialog host died mid-prompt - falling back to legacy spawn" | Out-Null
+            # fall through
         }
 
         $userInfo = Get-InteractiveUser
@@ -7929,7 +7954,7 @@ if ($LIST -and $LIST.Count -gt 0) {
         # Failure here populates $Script:DialogLegacyFallback so all dialog wrappers
         # transparently fall back to the legacy per-dialog spawn path.
         if ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
-            Write-Log -Message "Starting persistent dialog host (v9.33)"
+            Write-Log -Message "Starting persistent dialog host"
             Start-DialogHost | Out-Null
         }
 
