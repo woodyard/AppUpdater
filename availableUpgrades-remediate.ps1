@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.59
- Tag: 59
+ Version: 9.60
+ Tag: 60
     
     Version History:
     1.0 - Initial version
@@ -124,6 +124,7 @@
     9.57 - DOCS: Reordered the version-history block. Entries 9.41 through 9.55 had been prepended at the top of the block over several sessions, leaving a confusing 9.40 -> 9.55 -> 9.54 -> ... -> 9.41 -> 9.56 sequence. Block is now strictly ascending 1.0 -> 9.57 so a reader can scroll top-to-bottom and follow the chronological evolution. No code change.
     9.58 - UX: ProgressPanel status-text gap widened. The status TextBlock (e.g. "Downloading 4.2 MB / 12.0 MB", "Installing update...") shared Grid.Row 2 with the 3 px ProgressBar and was positioned with Margin="0,12,0,0", giving only ~9 px of clear space between the bar and the text. Felt cramped during live runs. Bumped top margin to 20 so the bar and status read as two distinct elements.
     9.59 - UX: Completion panel now actually stays visible long enough to read. Reported by the user: "when the dialog closes after the last update there is not enough time to read it, I see a glimpse of a green icon and then it disappears. Maybe this also happens between app upgrades?" Two problems were stacked: (a) the per-app complete -> next-app transition path was racing - Show-CompletionNotification sent `complete` then immediately returned to the caller, which proceeded to the next app and emitted `transition` within ms, and v9.48's transition-cancels-hideTimer logic swapped the panel before the green icon registered visually. (b) The final `complete` after the foreach loop relied on the host's auto-hide timer (3 s pre-v9.59), but Stop-DialogHost in the user-context-handoff path can force-kill the host within ~5 s of the user-context script exiting, which often pre-empted the auto-hide. Fixes: (1) host's auto-hide timer bumped from 3 s -> 7 s so when it does fire it's actually readable; (2) Show-CompletionNotification's host-path branch now Start-Sleeps 2 s after sending the `complete` command so the per-app panel dwells before the next iteration's `transition` swaps it; (3) the final post-loop `complete` is followed by Start-Sleep 5 s so the summary panel ("Updates complete - N apps processed") is visible for the full dwell before the script proceeds to user-context handoff scheduling or exits and lets SYSTEM tear down the host. Net effect: per-app icon visible for ~2 s, final summary visible for ~5 s minimum (longer if user-context handoff is involved since SYSTEM blocks on that), and the 7 s auto-hide remains as a clean fade-out when nothing tears the host down sooner.
+    9.60 - FIX/UX: Two unrelated changes bundled together. (a) New-HiddenLaunchAction's VBS launcher would throw "Microsoft VBScript compilation error: Unterminated string constant" if the PowerShellArguments string ever contained a stray CR/LF - the original `.Replace('"','""')` doubled-quote escaping wrapped the whole args string inside a single VBS `.Run "..."` literal, so any embedded newline terminated the string mid-line and pointed the parser at an offset like "line 2 char 339". Reported by the user on 2026-05-13 (HiddenLaunch_480682102.vbs error popped up on screen between Notepad++ and 7zip upgrades). Replaced the doubled-quote scheme with Chr(34) concatenation (each embedded `"` becomes `" & Chr(34) & "`, evaluating to a literal `"` at VBS runtime), and added a CR/LF sanitisation pass that strips line breaks and logs a warning so we have diagnostic breadcrumbs the next time something upstream slips a newline in. The Chr(34) approach is also robust against empty/edge-case argument values that the previous doubled-quote scheme could mis-parse. (b) The deferral dialog now warns the user that clicking "Update Now" will close the running app and that they should save their work first, but only when a blocking process is actually active (no point warning when the app isn't open). Applied to both the persistent dialog host path (extra trailing line appended to the body) and the legacy WPF spawn fallback (extra line appended to $processText so the existing block of running-app text is one cohesive paragraph).
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -323,14 +324,26 @@ function New-HiddenLaunchAction {
         # WPF dialogs appear independently via Topmost + Activate() regardless of console window style
         $windowStyle = 0
 
-        # Escape double quotes for VBS string (VBS uses "" to escape quotes)
-        $escapedArgs = $PowerShellArguments.Replace('"', '""')
+        # v9.60: Robust VBS string composition.
+        # Previously we did $PowerShellArguments.Replace('"', '""') and wrapped the whole thing
+        # in "..." inside the VBS .Run line. That broke catastrophically if the args ever
+        # contained a literal CR/LF (field report 2026-05-13: HiddenLaunch_*.vbs threw
+        # "Unterminated string constant at line 2 char 339" - the LF terminated the .Run "..."
+        # string mid-line). Now: (a) strip any stray CR/LF from the args (no legitimate args
+        # contain them - log a warning if we see any), (b) escape embedded quotes via
+        # Chr(34) concatenation instead of VBS's doubled-quote escape so we sidestep the
+        # entire class of doubled-quote parser ambiguities.
+        $cleanedArgs = $PowerShellArguments -replace "[`r`n]+", " "
+        if ($cleanedArgs.Length -ne $PowerShellArguments.Length) {
+            Write-Log "WARNING: stripped CR/LF from PowerShellArguments before VBS generation (length $($PowerShellArguments.Length) -> $($cleanedArgs.Length))" | Out-Null
+        }
+        $vbsArgsLiteral = '"' + $cleanedArgs.Replace('"', '" & Chr(34) & "') + '"'
         # VBS self-deletes after the child process finishes (.Run with True waits)
         # On Error Resume Next prevents "Permission denied" dialog when SYSTEM owns the file
         # and the user context cannot delete it (the SYSTEM parent cleans up regardless)
         $vbsContent = @"
 On Error Resume Next
-CreateObject("WScript.Shell").Run "$escapedArgs", $windowStyle, True
+CreateObject("WScript.Shell").Run $vbsArgsLiteral, $windowStyle, True
 CreateObject("Scripting.FileSystemObject").DeleteFile WScript.ScriptFullName, True
 "@
 
@@ -4758,9 +4771,12 @@ function Show-DeferralDialog {
             } else {
                 # Deferrable - route as prompt-deferral
                 $daysLeft = if ($DeferralStatus.PSObject.Properties['DaysRemaining']) { [int]$DeferralStatus.DaysRemaining } elseif ($DeferralStatus.PSObject.Properties['MaxDeferralDays']) { [int]$DeferralStatus.MaxDeferralDays } else { $null }
+                # v9.60: warn the user that Update Now will close the running app, so they
+                # can save their work first. Only relevant when a blocking process is active.
+                $closeWarning = if ($hasBlockingProcess) { "`n`nClicking " + [char]0x201C + "Update Now" + [char]0x201D + " will close $displayName - please save your work first." } else { "" }
                 $reply = Send-DialogCommand -Cmd "prompt-deferral" -Payload @{
                     title = "Update Available: $displayName"
-                    body = $versionText + "`n`n" + [string]$DeferralStatus.Message
+                    body = $versionText + "`n`n" + [string]$DeferralStatus.Message + $closeWarning
                     daysLeft = $daysLeft
                     canDefer = ($DeferralStatus.CanDefer -eq $true)
                     timeoutSec = $TimeoutSeconds
@@ -4785,8 +4801,9 @@ function Show-DeferralDialog {
             $versionText = "Update available for $displayName`n`n"
         }
         
+        # v9.60: legacy WPF fallback also gets the save-your-work warning when the app is open.
         $processText = if ($hasBlockingProcess) {
-            "$displayName is currently running and must be closed to proceed with the update.`n`n"
+            "$displayName is currently running and must be closed to proceed with the update.`nPlease save your work before clicking Update Now.`n`n"
         } else {
             ""
         }
