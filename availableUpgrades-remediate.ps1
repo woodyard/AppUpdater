@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.57
- Tag: 57
+ Version: 9.58
+ Tag: 58
     
     Version History:
     1.0 - Initial version
@@ -122,6 +122,7 @@
     9.55 - FIX: Two issues from the 18:44 field log. (a) SYSTEM was still allowed to try "unknown"-scope tasks (allowedScopes was @("machine","unknown")). With detect.ps1 v5.60's visibility probe in place, anything reaching remediate as "unknown" has been proven invisible-to-SYSTEM during detection - SYSTEM trying anyway wastes the attempt AND bumps the per-version failure counter, which combined with the 3-strikes skip-version dialog can remove the task before the user-context retry handoff gets its turn. Git.Git hit exactly this race: SYSTEM-failure bumped count to 3/3, skip dialog fired, task removed at 18:45:00 - user-context handoff started at 18:45:00 but Git.Git was no longer in the task file. Fix: SYSTEM's allowedScopes is now @("machine") only; "unknown" tasks bypass SYSTEM entirely and go straight to user-context (where v9.54's RunLevel Highest gives admin users the elevation they need). The v9.49 $unknownAlsoOther mechanism becomes redundant and is removed. (b) The "Retry" button on the skip-version dialog was effectively meaningless - both Skip and Retry called Remove-UpgradeTaskEntry regardless, so Retry just suppressed the Skipped=true flag without any other effect. Reported by the user: "I pressed Retry, is there a bug there?" Yes there was. Fixed: Skip behaves as before (set Skipped flag + remove from task file); Retry now clears the accumulated failure count via Clear-VersionFailureData AND keeps the task entry so the next remediation cycle gets a fresh 3-attempt budget against the same version.
     9.56 - UX: Persistent dialog host tweaks per user request. (a) Anchor moved closer to the taskbar - $anchorMargin reduced from 20 px to 6 px and $anchorRight from 20 to 12 - so the window now sits tight against the work-area corner instead of floating midway up. SizeToContent="Height" + the v9.34 Reposition-AnchoredBottomRight handler keep the bottom edge pinned regardless of which panel is showing. (b) Border colour darkened on both themes (dark: #FF323232 -> #FF606060; light: #FFD1D1D1 -> #FF9A9A9A) so the existing 1 px BorderThickness reads as a crisp fine line against the panel background; the rounded corners + drop shadow previously washed the border into the background and the dialog looked frameless. No XAML structure change - just the two ARGB literals in the theme block.
     9.57 - DOCS: Reordered the version-history block. Entries 9.41 through 9.55 had been prepended at the top of the block over several sessions, leaving a confusing 9.40 -> 9.55 -> 9.54 -> ... -> 9.41 -> 9.56 sequence. Block is now strictly ascending 1.0 -> 9.57 so a reader can scroll top-to-bottom and follow the chronological evolution. No code change.
+    9.58 - UX: ProgressPanel status-text gap widened. The status TextBlock (e.g. "Downloading 4.2 MB / 12.0 MB", "Installing update...") shared Grid.Row 2 with the 3 px ProgressBar and was positioned with Margin="0,12,0,0", giving only ~9 px of clear space between the bar and the text. Felt cramped during live runs. Bumped top margin to 20 so the bar and status read as two distinct elements.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -753,7 +754,7 @@ try {
         <TextBlock Grid.Row="0" Name="ProgressTitle" Text="Updating..." Foreground="$textColor" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,2"/>
         <TextBlock Grid.Row="1" Name="ProgressVersion" Text="" Foreground="$subColor" FontSize="11" Margin="0,0,0,6"/>
         <ProgressBar Grid.Row="2" Name="ProgressBar" IsIndeterminate="True" Height="3" Foreground="#FF0078D4"/>
-        <TextBlock Grid.Row="2" Name="ProgressStatus" Text="Preparing..." Foreground="$subColor" FontSize="11" HorizontalAlignment="Center" Margin="0,12,0,0"/>
+        <TextBlock Grid.Row="2" Name="ProgressStatus" Text="Preparing..." Foreground="$subColor" FontSize="11" HorizontalAlignment="Center" Margin="0,20,0,0"/>
       </Grid>
 
       <!-- TransitionPanel: brief "Done X -> Starting Y" between apps -->
