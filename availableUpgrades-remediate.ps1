@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.58
- Tag: 58
+ Version: 9.59
+ Tag: 59
     
     Version History:
     1.0 - Initial version
@@ -123,6 +123,7 @@
     9.56 - UX: Persistent dialog host tweaks per user request. (a) Anchor moved closer to the taskbar - $anchorMargin reduced from 20 px to 6 px and $anchorRight from 20 to 12 - so the window now sits tight against the work-area corner instead of floating midway up. SizeToContent="Height" + the v9.34 Reposition-AnchoredBottomRight handler keep the bottom edge pinned regardless of which panel is showing. (b) Border colour darkened on both themes (dark: #FF323232 -> #FF606060; light: #FFD1D1D1 -> #FF9A9A9A) so the existing 1 px BorderThickness reads as a crisp fine line against the panel background; the rounded corners + drop shadow previously washed the border into the background and the dialog looked frameless. No XAML structure change - just the two ARGB literals in the theme block.
     9.57 - DOCS: Reordered the version-history block. Entries 9.41 through 9.55 had been prepended at the top of the block over several sessions, leaving a confusing 9.40 -> 9.55 -> 9.54 -> ... -> 9.41 -> 9.56 sequence. Block is now strictly ascending 1.0 -> 9.57 so a reader can scroll top-to-bottom and follow the chronological evolution. No code change.
     9.58 - UX: ProgressPanel status-text gap widened. The status TextBlock (e.g. "Downloading 4.2 MB / 12.0 MB", "Installing update...") shared Grid.Row 2 with the 3 px ProgressBar and was positioned with Margin="0,12,0,0", giving only ~9 px of clear space between the bar and the text. Felt cramped during live runs. Bumped top margin to 20 so the bar and status read as two distinct elements.
+    9.59 - UX: Completion panel now actually stays visible long enough to read. Reported by the user: "when the dialog closes after the last update there is not enough time to read it, I see a glimpse of a green icon and then it disappears. Maybe this also happens between app upgrades?" Two problems were stacked: (a) the per-app complete -> next-app transition path was racing - Show-CompletionNotification sent `complete` then immediately returned to the caller, which proceeded to the next app and emitted `transition` within ms, and v9.48's transition-cancels-hideTimer logic swapped the panel before the green icon registered visually. (b) The final `complete` after the foreach loop relied on the host's auto-hide timer (3 s pre-v9.59), but Stop-DialogHost in the user-context-handoff path can force-kill the host within ~5 s of the user-context script exiting, which often pre-empted the auto-hide. Fixes: (1) host's auto-hide timer bumped from 3 s -> 7 s so when it does fire it's actually readable; (2) Show-CompletionNotification's host-path branch now Start-Sleeps 2 s after sending the `complete` command so the per-app panel dwells before the next iteration's `transition` swaps it; (3) the final post-loop `complete` is followed by Start-Sleep 5 s so the summary panel ("Updates complete - N apps processed") is visible for the full dwell before the script proceeds to user-context handoff scheduling or exits and lets SYSTEM tear down the host. Net effect: per-app icon visible for ~2 s, final summary visible for ~5 s minimum (longer if user-context handoff is involved since SYSTEM blocks on that), and the 7 s auto-hide remains as a clean fade-out when nothing tears the host down sooner.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -979,11 +980,12 @@ try {
                 $window.FindName("CompletionBody").Text  = if ($obj.body) { [string]$obj.body } else { "" }
                 Show-Panel "Completion"
                 Ensure-Visible
-                # Auto-hide after 3 s. v9.37: hideTimer must live in script scope, not as a
-                # function-local, or the closure can't find it when the dispatcher fires.
+                # Auto-hide after 7 s (v9.59: bumped from 3 s - 3 s was too short to read
+                # the icon + title + body line). v9.37: hideTimer must live in script scope,
+                # not as a function-local, or the closure can't find it when the dispatcher fires.
                 if ($script:hideTimer) { try { $script:hideTimer.Stop() } catch {} }
                 $script:hideTimer = New-Object System.Windows.Threading.DispatcherTimer
-                $script:hideTimer.Interval = [TimeSpan]::FromSeconds(3)
+                $script:hideTimer.Interval = [TimeSpan]::FromSeconds(7)
                 $script:hideTimer.Add_Tick({
                     try {
                         if ($script:hideTimer) { $script:hideTimer.Stop() }
@@ -3274,7 +3276,13 @@ function Show-CompletionNotification {
                 title = if ($Success) { "Update complete" } else { "Update could not be completed" }
                 body = $displayName
             }
-            if ($sent) { return }
+            if ($sent) {
+                # v9.59: dwell briefly so the user actually sees the per-app completion panel.
+                # Without this the next app's `transition` arrives within ms and v9.48's hide-timer
+                # cancellation swaps the panel before the green icon registers visually.
+                Start-Sleep -Seconds 2
+                return
+            }
             # fall through to legacy on host send failure
         }
 
@@ -8939,6 +8947,11 @@ if ($LIST -and $LIST.Count -gt 0) {
                 title = if ($hadFailure) { "Some updates failed" } else { "Updates complete" }
                 body = $body
             } | Out-Null
+            # v9.59: dwell so the user can read the final summary panel before the script
+            # proceeds to user-context handoff (SYSTEM path) or exits and lets SYSTEM tear
+            # the host down (user-context path). Without this the panel could be force-killed
+            # by Stop-DialogHost within ~5 s, and the v9.59 7 s auto-hide never gets to fire.
+            Start-Sleep -Seconds 5
         }
 
         # If we're in SYSTEM context, hand off to user context only when the task file
