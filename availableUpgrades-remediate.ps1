@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.55
- Tag: 55
+ Version: 9.56
+ Tag: 56
     
     Version History:
     1.0 - Initial version
@@ -120,6 +120,7 @@
     9.43 - FIX: On a freshly-set-up Windows machine the dialog host failed to start - parent logged "Dialog host did not heartbeat within 8 s" and fell back to legacy spawn, AND no preserved host log was produced. The host process actually started but died before its first Write-DH call. Root cause: when C:\ProgramData\Temp was freshly created by SYSTEM (Start-DialogHost's auto-create branch), it inherited C:\ProgramData's default ACL which grants Users only Read+Execute - not Create-File. v9.41's ACL fix granted the user Modify on the FILES that SYSTEM had pre-created (CmdFile/CursorFile/HeartbeatFile), but the host's very first action is to WriteAllText its OWN files (PidFile, LogFile, replies/*.json), and the user couldn't CREATE new files in the parent directory. The host's WriteAllText on PidFile threw Access Denied, the process died, no Write-DH ever fired, and the parent waited 8 s on a heartbeat that would never come. Two fixes: (a) Session files now live inside a per-session SUBDIRECTORY (C:\ProgramData\Temp\availableUpgrades-dialog-<id>\{cmd, cursor, heartbeat, pid, host.log, replies\}); SYSTEM creates that directory and grants the user Modify with ContainerInherit+ObjectInherit, so every file the host wants to create inside it just works. (b) Heartbeat wait window bumped from 8 s to 15 s to cover slow first-run WPF cold start. Stop-DialogHost moves the log out to a flat sibling location before removing the per-session directory, so log preservation still works.
     9.42 - FIX: v9.39's "pin registry path to WOW6432Node" approach was based on the wrong WoW64 semantics. PSDrive registry cmdlets (Get-ItemProperty, Set-ItemProperty, etc.) go through the WoW64 redirector, which from a 32-bit PowerShell host rewrites HKLM:\SOFTWARE\X to HKLM:\SOFTWARE\WOW6432Node\X *unconditionally* - it does not notice that WOW6432Node is already in the requested path. So v9.39's writes to HKLM:\SOFTWARE\WOW6432Node\AppUpdater\Deferrals\... actually landed at HKLM:\SOFTWARE\WOW6432Node\WOW6432Node\AppUpdater\Deferrals\... (confirmed in field: Notepad++.Notepad++ deferral with the v9.41 ACL fix was discovered at the double-WOW path). Proper fix: introduced Open-AppRegKey / Test-AppRegKey / Get-AppRegValue / Get-AppRegProperties / Set-AppRegValue / Remove-AppRegValue / Remove-AppRegKey / Get-AppRegChildKeyNames helpers that use [Microsoft.Win32.RegistryKey]::OpenBaseKey(LocalMachine, Registry64), explicitly requesting the 64-bit view and bypassing the redirector entirely. All 12 PSDrive call sites in remediate.ps1 (Initialize-DeferralRegistry, Get-AppReleaseDate, Get-DeferralStatus, Set-WhitelistedAppDeferral, the deferral/cache cleanup, and the four Get/Set/Clear-VersionFailure functions) routed through the helpers. Data now lives at HKLM:\SOFTWARE\AppUpdater (visible from any 32-bit OR 64-bit observer at the natural path). Existing state at HKLM:\SOFTWARE\WOW6432Node\WOW6432Node\AppUpdater is orphaned with no automatic migration. Operator cleanup: Remove-Item 'HKLM:\SOFTWARE\WOW6432Node\WOW6432Node\AppUpdater' -Recurse -Force.
     9.41 - FIX: Real root cause of "host died mid-prompt" and the "two dialogs on screen" symptom. SYSTEM creates the session IPC files (CmdFile, CursorFile, HeartbeatFile) in C:\ProgramData\Temp, where the default ACL gives CREATOR OWNER (i.e. SYSTEM) full control and Users only read. The user-context host process can therefore READ the cmd file but its WriteAllText on CursorFile and HeartbeatFile silently fails with "Access denied". The previous code swallowed those failures in a no-op catch, so the heartbeat file timestamp never refreshed - and ~10 s after host startup, the parent's Test-DialogHostAlive declared the host dead based on stale heartbeat while the host was alive and rendering a dialog. Send-DialogCommand then returned $null, the v9.36 wrapper fell through to the legacy spawn, and the user saw the legacy dialog appear on top of the still-up host dialog. Two fixes: (a) Start-DialogHost now explicitly grants the interactive user Modify rights on CmdFile/CursorFile/HeartbeatFile (via SetAccessRule) and on the ReplyDir (via inherited Modify) immediately after creating them, so the host can actually write its own heartbeat. (b) The pump's heartbeat-write catch now logs the first failure via Write-DH (suppresses repeats) instead of silently swallowing, so any future ACL/IO failure shows up immediately in the host log instead of producing a mysterious false-positive 10 s later. With these in place, the dialog host should remain provably alive throughout a 120 s prompt - no fallback spawn, one dialog on screen, then teardown when the user clicks Defer or Update Now.
+    9.56 - UX: Persistent dialog host tweaks per user request. (a) Anchor moved closer to the taskbar - $anchorMargin reduced from 20 px to 6 px and $anchorRight from 20 to 12 - so the window now sits tight against the work-area corner instead of floating midway up. SizeToContent="Height" + the v9.34 Reposition-AnchoredBottomRight handler keep the bottom edge pinned regardless of which panel is showing. (b) Border colour darkened on both themes (dark: #FF323232 -> #FF606060; light: #FFD1D1D1 -> #FF9A9A9A) so the existing 1 px BorderThickness reads as a crisp fine line against the panel background; the rounded corners + drop shadow previously washed the border into the background and the dialog looked frameless. No XAML structure change - just the two ARGB literals in the theme block.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -719,10 +720,10 @@ try {
         $isDark = $themeKey.AppsUseLightTheme -eq 0
     } catch {}
     if ($isDark) {
-        $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $textColor = "#FFFFFFFF"
+        $bgColor = "#FF1F1F1F"; $borderColor = "#FF606060"; $textColor = "#FFFFFFFF"
         $subColor = "#FFCCCCCC"; $shadowOpacity = "0.6"; $closeBtnFg = "#FF888888"
     } else {
-        $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $textColor = "#FF1B1B1B"
+        $bgColor = "#FFF3F3F3"; $borderColor = "#FF9A9A9A"; $textColor = "#FF1B1B1B"
         $subColor = "#FF555555"; $shadowOpacity = "0.25"; $closeBtnFg = "#FF999999"
     }
 
@@ -830,8 +831,8 @@ try {
     # v9.34: anchor the window to the bottom-right of the work area on every size change.
     # The previous fixed Top of (Bottom - 200) was set before content existed; SizeToContent
     # then expanded the window downward and pushed it below the taskbar on the active monitor.
-    $script:anchorMargin = 20
-    $script:anchorRight  = 20
+    $script:anchorMargin = 6
+    $script:anchorRight  = 12
     function Reposition-AnchoredBottomRight {
         $h = if ($window.ActualHeight -gt 0) { $window.ActualHeight } else { $window.Height }
         if (-not $h -or $h -le 0) { $h = 140 }
