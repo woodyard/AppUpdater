@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.61
- Tag: 61
+ Version: 9.62
+ Tag: 62
     
     Version History:
     1.0 - Initial version
@@ -126,6 +126,7 @@
     9.59 - UX: Completion panel now actually stays visible long enough to read. Reported by the user: "when the dialog closes after the last update there is not enough time to read it, I see a glimpse of a green icon and then it disappears. Maybe this also happens between app upgrades?" Two problems were stacked: (a) the per-app complete -> next-app transition path was racing - Show-CompletionNotification sent `complete` then immediately returned to the caller, which proceeded to the next app and emitted `transition` within ms, and v9.48's transition-cancels-hideTimer logic swapped the panel before the green icon registered visually. (b) The final `complete` after the foreach loop relied on the host's auto-hide timer (3 s pre-v9.59), but Stop-DialogHost in the user-context-handoff path can force-kill the host within ~5 s of the user-context script exiting, which often pre-empted the auto-hide. Fixes: (1) host's auto-hide timer bumped from 3 s -> 7 s so when it does fire it's actually readable; (2) Show-CompletionNotification's host-path branch now Start-Sleeps 2 s after sending the `complete` command so the per-app panel dwells before the next iteration's `transition` swaps it; (3) the final post-loop `complete` is followed by Start-Sleep 5 s so the summary panel ("Updates complete - N apps processed") is visible for the full dwell before the script proceeds to user-context handoff scheduling or exits and lets SYSTEM tear down the host. Net effect: per-app icon visible for ~2 s, final summary visible for ~5 s minimum (longer if user-context handoff is involved since SYSTEM blocks on that), and the 7 s auto-hide remains as a clean fade-out when nothing tears the host down sooner.
     9.60 - FIX/UX: Two unrelated changes bundled together. (a) New-HiddenLaunchAction's VBS launcher would throw "Microsoft VBScript compilation error: Unterminated string constant" if the PowerShellArguments string ever contained a stray CR/LF - the original `.Replace('"','""')` doubled-quote escaping wrapped the whole args string inside a single VBS `.Run "..."` literal, so any embedded newline terminated the string mid-line and pointed the parser at an offset like "line 2 char 339". Reported by the user on 2026-05-13 (HiddenLaunch_480682102.vbs error popped up on screen between Notepad++ and 7zip upgrades). Replaced the doubled-quote scheme with Chr(34) concatenation (each embedded `"` becomes `" & Chr(34) & "`, evaluating to a literal `"` at VBS runtime), and added a CR/LF sanitisation pass that strips line breaks and logs a warning so we have diagnostic breadcrumbs the next time something upstream slips a newline in. The Chr(34) approach is also robust against empty/edge-case argument values that the previous doubled-quote scheme could mis-parse. (b) The deferral dialog now warns the user that clicking "Update Now" will close the running app and that they should save their work first, but only when a blocking process is actually active (no point warning when the app isn't open). Applied to both the persistent dialog host path (extra trailing line appended to the body) and the legacy WPF spawn fallback (extra line appended to $processText so the existing block of running-app text is one cohesive paragraph).
     9.61 - FIX: Regression from v9.60's CR/LF sanitisation. The user-prompt path (Invoke-SystemUserPrompt -> Show-UserPrompt_*.ps1 spawned via wscript+VBS) passed the question text as a raw -Question parameter that legitimately contained "`n`n" line breaks between sentences (e.g. "App update available\n\nThe application cannot be updated while running\n\nWould you like to close X now?"). v9.60 stripped those newlines so the dialog displayed everything as one run-on sentence. Discovered when inspecting HiddenLaunch_459789442.vbs left in the repo by the user. Brought the user-prompt path in line with the deferral/mandatory/skip paths by base64-encoding the question and title before passing them as -EncodedQuestion / -EncodedTitle args. The receiving Show-UserPrompt_*.ps1 script now accepts both the legacy -Question / -Title and the new -EncodedQuestion / -EncodedTitle params and decodes whichever is present; UTF-8 base64 has no whitespace in its alphabet so it survives both the VBS .Run string and the v9.60 CR/LF sanitiser intact. Applied to the primary spawn at New-UserPromptTask (~line 1464) and the Azure AD SYSTEM fallback (~line 1586).
+    9.62 - FIX: Close-app prompt for non-deferral apps was invisible behind the persistent dialog host. Reported by the user via the 13-05-26 log: Notepad++'s close-app prompt (deferral-enabled, routed through the host) worked correctly, but 7-Zip's close-app prompt (deferral-disabled, fell to Invoke-SystemUserPrompt's legacy WPF spawn via wscript+VBS) silently timed out after 120 s on three consecutive runs (v9.59/v9.60/v9.61). Root cause: between apps the host shows a "Notepad++ updated -> Starting 7-Zip" transition panel at the bottom-right corner; the legacy spawn's WPF window targets the SAME bottom-right corner and is also Topmost. Z-order between two cross-process Topmost windows is undefined and Windows' foreground-stealing protections prevented the newer legacy dialog from coming to front, so it stayed hidden behind the host's transition panel for the full 120 s. Show-ProcessCloseDialog's no-deferral branch now routes through the persistent dialog host's prompt-deferral panel when Test-DialogHostAlive: payload uses canDefer=true (both Defer and Update Now active), daysLeft=null (counter suppressed since these apps have no day-based deferral). Update Now -> close+update, Defer -> keep app open, timeout -> falls back to $DefaultTimeoutAction. Legacy WPF spawn remains as the fallback when the host is not alive (e.g. host startup failed) or doesn't reply. Also adds the v9.60 "save your work first" warning to the legacy WPF body so both paths show the same advice.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -2485,7 +2486,7 @@ function Show-ProcessCloseDialog {
         } else {
             # Use legacy simple dialog for apps without deferral support
             Write-Log -Message "Using legacy dialog for $AppName (no deferral support)" | Out-Null
-            
+
             # Create the question text with version information
             $versionText = ""
             if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
@@ -2493,33 +2494,68 @@ function Show-ProcessCloseDialog {
             } else {
                 $versionText = "An update is available for $friendlyName`n`n"
             }
-            
-            $question = "${versionText}The application cannot be updated while it is running.`n`nWould you like to close $friendlyName now to allow the update to proceed?"
+
+            $question = "${versionText}The application cannot be updated while it is running.`n`nPlease save your work before clicking Update Now.`n`nWould you like to close $friendlyName now to allow the update to proceed?"
             $title = if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
                 "Update ${friendlyName}: ${CurrentVersion} -> ${AvailableVersion}"
             } else {
                 "${friendlyName} Update Available"
             }
-            
+
+            # v9.62: when the persistent dialog host is alive, route this prompt through
+            # the host's deferral panel instead of spawning a legacy WPF window via VBS.
+            # The legacy spawn would land at the same bottom-right corner the host's
+            # transition panel ("App updated -> Starting next") is currently occupying,
+            # and Topmost Z-order between the two cross-process windows is undefined - in
+            # field reports the legacy window stayed hidden behind the host's transition
+            # panel for the full 120 s timeout, so the user never saw the close-app prompt
+            # and the script silently fell through with CloseProcess=$DefaultTimeoutAction.
+            # The host's deferral panel maps cleanly: Update Now -> close+update,
+            # Defer -> keep app open. canDefer=true so both buttons are active even
+            # though there's no actual day-based deferral state for these apps.
+            if (Test-DialogHostAlive) {
+                Write-Log -Message "Routing close-app prompt for $friendlyName through persistent dialog host" | Out-Null
+                $hostReply = Send-DialogCommand -Cmd "prompt-deferral" -Payload @{
+                    title = $title
+                    body = $question
+                    daysLeft = $null
+                    canDefer = $true
+                    timeoutSec = $TimeoutSeconds
+                } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
+                if ($hostReply -and $hostReply.response) {
+                    $choice = [string]$hostReply.response
+                    $userChoice = ($choice -eq "update")
+                    if ($choice -eq "timeout") { $userChoice = [bool]$DefaultTimeoutAction }
+                    Write-Log -Message "Host close-app reply: $choice (CloseProcess=$userChoice)" | Out-Null
+                    return @{
+                        CloseProcess = $userChoice
+                        DeferralDays = 0
+                        Action = if ($userChoice) { "Update" } else { "Cancel" }
+                        UserChoice = $userChoice
+                    }
+                }
+                Write-Log -Message "Dialog host did not reply - falling back to legacy WPF spawn" | Out-Null
+            }
+
             # Convert DefaultTimeoutAction boolean to string format
             $defaultActionString = if ($DefaultTimeoutAction) { "OK" } else { "Cancel" }
-            
+
             Write-Log -Message "Showing legacy WPF dialog for $friendlyName with ${TimeoutSeconds}s timeout, default action: $defaultActionString" | Out-Null
-            
+
             # Call the context-aware dialog system
             $response = Show-UserDialog -Question $question -Title $title -TimeoutSeconds $TimeoutSeconds -DefaultAction $defaultActionString
-            
+
             Write-Log -Message "Legacy WPF dialog response: $response" | Out-Null
-            
+
             # Convert response back to boolean and return structured response
             $userChoice = ($response -eq "OK")
-            
+
             if ($userChoice) {
                 Write-Log -Message "User chose to close $friendlyName for update" | Out-Null
             } else {
                 Write-Log -Message "User chose to keep $friendlyName open" | Out-Null
             }
-            
+
             return @{
                 CloseProcess = $userChoice
                 DeferralDays = 0
