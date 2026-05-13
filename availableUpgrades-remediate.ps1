@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.62
- Tag: 62
+ Version: 9.63
+ Tag: 63
     
     Version History:
     1.0 - Initial version
@@ -127,6 +127,7 @@
     9.60 - FIX/UX: Two unrelated changes bundled together. (a) New-HiddenLaunchAction's VBS launcher would throw "Microsoft VBScript compilation error: Unterminated string constant" if the PowerShellArguments string ever contained a stray CR/LF - the original `.Replace('"','""')` doubled-quote escaping wrapped the whole args string inside a single VBS `.Run "..."` literal, so any embedded newline terminated the string mid-line and pointed the parser at an offset like "line 2 char 339". Reported by the user on 2026-05-13 (HiddenLaunch_480682102.vbs error popped up on screen between Notepad++ and 7zip upgrades). Replaced the doubled-quote scheme with Chr(34) concatenation (each embedded `"` becomes `" & Chr(34) & "`, evaluating to a literal `"` at VBS runtime), and added a CR/LF sanitisation pass that strips line breaks and logs a warning so we have diagnostic breadcrumbs the next time something upstream slips a newline in. The Chr(34) approach is also robust against empty/edge-case argument values that the previous doubled-quote scheme could mis-parse. (b) The deferral dialog now warns the user that clicking "Update Now" will close the running app and that they should save their work first, but only when a blocking process is actually active (no point warning when the app isn't open). Applied to both the persistent dialog host path (extra trailing line appended to the body) and the legacy WPF spawn fallback (extra line appended to $processText so the existing block of running-app text is one cohesive paragraph).
     9.61 - FIX: Regression from v9.60's CR/LF sanitisation. The user-prompt path (Invoke-SystemUserPrompt -> Show-UserPrompt_*.ps1 spawned via wscript+VBS) passed the question text as a raw -Question parameter that legitimately contained "`n`n" line breaks between sentences (e.g. "App update available\n\nThe application cannot be updated while running\n\nWould you like to close X now?"). v9.60 stripped those newlines so the dialog displayed everything as one run-on sentence. Discovered when inspecting HiddenLaunch_459789442.vbs left in the repo by the user. Brought the user-prompt path in line with the deferral/mandatory/skip paths by base64-encoding the question and title before passing them as -EncodedQuestion / -EncodedTitle args. The receiving Show-UserPrompt_*.ps1 script now accepts both the legacy -Question / -Title and the new -EncodedQuestion / -EncodedTitle params and decodes whichever is present; UTF-8 base64 has no whitespace in its alphabet so it survives both the VBS .Run string and the v9.60 CR/LF sanitiser intact. Applied to the primary spawn at New-UserPromptTask (~line 1464) and the Azure AD SYSTEM fallback (~line 1586).
     9.62 - FIX: Close-app prompt for non-deferral apps was invisible behind the persistent dialog host. Reported by the user via the 13-05-26 log: Notepad++'s close-app prompt (deferral-enabled, routed through the host) worked correctly, but 7-Zip's close-app prompt (deferral-disabled, fell to Invoke-SystemUserPrompt's legacy WPF spawn via wscript+VBS) silently timed out after 120 s on three consecutive runs (v9.59/v9.60/v9.61). Root cause: between apps the host shows a "Notepad++ updated -> Starting 7-Zip" transition panel at the bottom-right corner; the legacy spawn's WPF window targets the SAME bottom-right corner and is also Topmost. Z-order between two cross-process Topmost windows is undefined and Windows' foreground-stealing protections prevented the newer legacy dialog from coming to front, so it stayed hidden behind the host's transition panel for the full 120 s. Show-ProcessCloseDialog's no-deferral branch now routes through the persistent dialog host's prompt-deferral panel when Test-DialogHostAlive: payload uses canDefer=true (both Defer and Update Now active), daysLeft=null (counter suppressed since these apps have no day-based deferral). Update Now -> close+update, Defer -> keep app open, timeout -> falls back to $DefaultTimeoutAction. Legacy WPF spawn remains as the fallback when the host is not alive (e.g. host startup failed) or doesn't reply. Also adds the v9.60 "save your work first" warning to the legacy WPF body so both paths show the same advice.
+    9.63 - REFACTOR (part 1 of 2): Persistent dialog host is now mandatory - legacy per-task WPF spawn fallback has been removed from every wrapper. Background: per the user "seems off that a switch to legacy is needed. Shouldn't we just fix the issue?" - the legacy fallback was a parallel codebase nobody exercised, so host bugs either went unnoticed (silent fallback masked them) or got "fixed" by re-routing through legacy instead of hardening the host. Each wrapper now returns a safe default when Test-DialogHostAlive is false: Show-CompletionNotification logs and skips; Show-UpgradeProgressNotification returns $null; Write-InfoDialogStatus no-ops; Show-MandatoryUpdateDialog returns "Continue" (mandatory always proceeds); Show-DeferralDialog returns Action=Update with CloseProcess=$hasBlockingProcess (leaving the app skipped indefinitely would just stack tasks); Show-VersionSkipDialog returns $false (retry next cycle); Show-ProcessCloseDialog returns CloseProcess=$DefaultTimeoutAction. The orphaned legacy helper functions (Invoke-SystemUserPrompt, Invoke-SystemCompletionNotification, Invoke-SystemDeferralPrompt, Show-DirectUserDialog, Show-DirectCompletionNotification, Show-DirectDeferralDialog, Show-DirectMandatoryUpdateDialog, Show-UserDialog, Show-ModernDialog, Show-EnhancedDeferralDialog) and their embedded WPF here-strings are unreachable from the main remediation flow now but are left in place to keep this commit focused on the behavioural change; v9.64 deletes them as a pure dead-code cleanup. Diff: removed ~400 lines of legacy fallback bodies from the seven wrappers, parser-check still passes.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -2484,17 +2485,18 @@ function Show-ProcessCloseDialog {
             }
             
         } else {
-            # Use legacy simple dialog for apps without deferral support
-            Write-Log -Message "Using legacy dialog for $AppName (no deferral support)" | Out-Null
+            # No deferral support - route close-app prompt through the persistent dialog host.
+            # The host's deferral panel maps cleanly: Update Now -> close+update,
+            # Defer -> keep app open. canDefer=true so both buttons are active even though
+            # there's no day-based deferral state for these apps.
+            Write-Log -Message "Routing close-app prompt for $friendlyName through persistent dialog host" | Out-Null
 
-            # Create the question text with version information
             $versionText = ""
             if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
                 $versionText = "$friendlyName $CurrentVersion -> $AvailableVersion update available`n`n"
             } else {
                 $versionText = "An update is available for $friendlyName`n`n"
             }
-
             $question = "${versionText}The application cannot be updated while it is running.`n`nPlease save your work before clicking Update Now.`n`nWould you like to close $friendlyName now to allow the update to proceed?"
             $title = if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
                 "Update ${friendlyName}: ${CurrentVersion} -> ${AvailableVersion}"
@@ -2502,60 +2504,28 @@ function Show-ProcessCloseDialog {
                 "${friendlyName} Update Available"
             }
 
-            # v9.62: when the persistent dialog host is alive, route this prompt through
-            # the host's deferral panel instead of spawning a legacy WPF window via VBS.
-            # The legacy spawn would land at the same bottom-right corner the host's
-            # transition panel ("App updated -> Starting next") is currently occupying,
-            # and Topmost Z-order between the two cross-process windows is undefined - in
-            # field reports the legacy window stayed hidden behind the host's transition
-            # panel for the full 120 s timeout, so the user never saw the close-app prompt
-            # and the script silently fell through with CloseProcess=$DefaultTimeoutAction.
-            # The host's deferral panel maps cleanly: Update Now -> close+update,
-            # Defer -> keep app open. canDefer=true so both buttons are active even
-            # though there's no actual day-based deferral state for these apps.
-            if (Test-DialogHostAlive) {
-                Write-Log -Message "Routing close-app prompt for $friendlyName through persistent dialog host" | Out-Null
-                $hostReply = Send-DialogCommand -Cmd "prompt-deferral" -Payload @{
-                    title = $title
-                    body = $question
-                    daysLeft = $null
-                    canDefer = $true
-                    timeoutSec = $TimeoutSeconds
-                } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
-                if ($hostReply -and $hostReply.response) {
-                    $choice = [string]$hostReply.response
-                    $userChoice = ($choice -eq "update")
-                    if ($choice -eq "timeout") { $userChoice = [bool]$DefaultTimeoutAction }
-                    Write-Log -Message "Host close-app reply: $choice (CloseProcess=$userChoice)" | Out-Null
-                    return @{
-                        CloseProcess = $userChoice
-                        DeferralDays = 0
-                        Action = if ($userChoice) { "Update" } else { "Cancel" }
-                        UserChoice = $userChoice
-                    }
+            # v9.63: host-only. If host isn't reachable, default to $DefaultTimeoutAction.
+            if (-not (Test-DialogHostAlive)) {
+                Write-Log -Message "Show-ProcessCloseDialog: dialog host not alive - defaulting to $DefaultTimeoutAction for $friendlyName" | Out-Null
+                return @{
+                    CloseProcess = $DefaultTimeoutAction
+                    DeferralDays = 0
+                    Action = if ($DefaultTimeoutAction) { "Update" } else { "Cancel" }
+                    UserChoice = $DefaultTimeoutAction
                 }
-                Write-Log -Message "Dialog host did not reply - falling back to legacy WPF spawn" | Out-Null
             }
 
-            # Convert DefaultTimeoutAction boolean to string format
-            $defaultActionString = if ($DefaultTimeoutAction) { "OK" } else { "Cancel" }
-
-            Write-Log -Message "Showing legacy WPF dialog for $friendlyName with ${TimeoutSeconds}s timeout, default action: $defaultActionString" | Out-Null
-
-            # Call the context-aware dialog system
-            $response = Show-UserDialog -Question $question -Title $title -TimeoutSeconds $TimeoutSeconds -DefaultAction $defaultActionString
-
-            Write-Log -Message "Legacy WPF dialog response: $response" | Out-Null
-
-            # Convert response back to boolean and return structured response
-            $userChoice = ($response -eq "OK")
-
-            if ($userChoice) {
-                Write-Log -Message "User chose to close $friendlyName for update" | Out-Null
-            } else {
-                Write-Log -Message "User chose to keep $friendlyName open" | Out-Null
-            }
-
+            $hostReply = Send-DialogCommand -Cmd "prompt-deferral" -Payload @{
+                title = $title
+                body = $question
+                daysLeft = $null
+                canDefer = $true
+                timeoutSec = $TimeoutSeconds
+            } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
+            $choice = if ($hostReply -and $hostReply.response) { [string]$hostReply.response } else { "timeout" }
+            $userChoice = ($choice -eq "update")
+            if ($choice -eq "timeout") { $userChoice = [bool]$DefaultTimeoutAction }
+            Write-Log -Message "Host close-app reply: $choice (CloseProcess=$userChoice)" | Out-Null
             return @{
                 CloseProcess = $userChoice
                 DeferralDays = 0
@@ -2802,243 +2772,21 @@ function Show-UpgradeProgressNotification {
 
     try {
         $displayName = if (-not [string]::IsNullOrEmpty($FriendlyName)) { $FriendlyName } else { $AppName }
-        $versionText = ""
-        if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
-            $versionText = "$CurrentVersion &#x2192; $AvailableVersion"
-        }
 
-        # v9.33: persistent dialog host path
+        # v9.63: host-only. Caller monitors winget output and pushes updates via
+        # Write-InfoDialogStatus, which sends `status` commands to the host.
         if (Test-DialogHostAlive) {
             Send-DialogCommand -Cmd "show-progress" -Payload @{
                 app = $displayName
                 fromVersion = $CurrentVersion
                 toVersion = $AvailableVersion
             } | Out-Null
-            return $null
-        }
-
-        Write-Log "Showing informational progress dialog for $displayName" | Out-Null
-
-        $userInfo = Get-InteractiveUser
-        if (-not $userInfo) {
-            Write-Log "No interactive user for progress notification" | Out-Null
-            return $null
-        }
-
-        $progressId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
-        $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
-        $signalFile = Join-Path $userTempPath "UpgradeProgress_$progressId`_Signal.json"
-        $scriptPath = Join-Path $userTempPath "Show-UpgradeProgress_$progressId.ps1"
-
-        # Escape for XAML
-        $escapedName = [System.Security.SecurityElement]::Escape($displayName)
-
-        $scriptContent = @'
-param(
-    [string]$SignalFilePath,
-    [string]$AppDisplayName,
-    [string]$VersionInfo
-)
-
-$logPath = Join-Path $env:TEMP "UpgradeProgress_Debug.log"
-function Write-ProgLog {
-    param([string]$Message)
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
-    "[$ts] $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
-}
-
-try {
-    Write-ProgLog "=== UPGRADE PROGRESS DIALOG STARTED ==="
-    Write-ProgLog "AppDisplayName: $AppDisplayName, VersionInfo: $VersionInfo"
-    Write-ProgLog "SignalFilePath: $SignalFilePath"
-
-    # Detect system theme
-    $isDark = $true
-    try {
-        $themeKey = Get-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -ErrorAction Stop
-        $isDark = $themeKey.AppsUseLightTheme -eq 0
-    } catch { }
-
-    if ($isDark) {
-        $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $textColor = "#FFCCCCCC"
-        $shadowOpacity = "0.6"; $closeBtnFg = "#FF888888"
-    } else {
-        $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $textColor = "#FF1B1B1B"
-        $shadowOpacity = "0.25"; $closeBtnFg = "#FF999999"
-    }
-
-    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
-
-    $workArea = [System.Windows.SystemParameters]::WorkArea
-
-    $escapedAppName = [System.Security.SecurityElement]::Escape($AppDisplayName)
-    $versionXml = ""
-    if ($VersionInfo) {
-        $versionXml = "<TextBlock Grid.Row=`"1`" Text=`"$VersionInfo`" Foreground=`"#FF888888`" FontSize=`"11`" Margin=`"0,0,0,4`"/>"
-    }
-
-    $xaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Updating $escapedAppName" Width="420" MinHeight="120" SizeToContent="Height" WindowStartupLocation="Manual"
-        ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
-    <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
-        <Border.Effect>
-            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/>
-        </Border.Effect>
-        <Grid>
-            <Grid Margin="20,16,20,16">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
-                </Grid.RowDefinitions>
-                <TextBlock Grid.Row="0" Name="TitleText" Text="Updating $escapedAppName..." Foreground="$textColor" FontSize="13" FontWeight="SemiBold" Margin="0,0,24,4"/>
-                $versionXml
-                <ProgressBar Grid.Row="2" Name="ProgressBar" IsIndeterminate="True" Height="3" Margin="0,8,0,6" Foreground="#FF0078D4"/>
-                <TextBlock Grid.Row="3" Name="StatusText" Text="Installing update..." Foreground="#FF888888" FontSize="11" HorizontalAlignment="Center"/>
-            </Grid>
-            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0" Background="Transparent" Foreground="$closeBtnFg" BorderThickness="0" FontSize="13" Cursor="Hand" FontFamily="Segoe UI Symbol"/>
-        </Grid>
-    </Border>
-</Window>
-"@
-
-    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
-    $window = [Windows.Markup.XamlReader]::Load($reader)
-    $window.Left = $workArea.Right - 440
-    $window.Top = $workArea.Bottom - 160
-
-    # Close button: suppress info dialogs for today and close
-    $closeButton = $window.FindName("CloseButton")
-    if ($closeButton) {
-        $closeButton.Add_Click({
-            Write-ProgLog "Close button clicked - suppressing info dialogs for today"
-            $suppressFile = Join-Path $env:TEMP "SuppressInfoDialogs_$(Get-Date -Format 'yyyy-MM-dd').flag"
-            "suppressed" | Out-File -FilePath $suppressFile -Encoding UTF8
-            $window.Close()
-        })
-    }
-
-    # Poll for signal file and status updates
-    $script:progressStartTime = Get-Date
-    $script:lastStatus = ""
-    $statusFilePath = $SignalFilePath -replace '\.json$', '_Status.txt'
-    $script:pollTimer = [System.Windows.Threading.DispatcherTimer]::new()
-    $script:pollTimer.Interval = [TimeSpan]::FromSeconds(2)
-    $script:pollTimer.Add_Tick({
-        # Check for status updates (non-final)
-        if (Test-Path $statusFilePath) {
-            try {
-                $currentStatus = (Get-Content $statusFilePath -Raw).Trim()
-                if ($currentStatus -and $currentStatus -ne $script:lastStatus) {
-                    $script:lastStatus = $currentStatus
-                    $window.FindName("StatusText").Text = $currentStatus
-                    Write-ProgLog "Status updated: $currentStatus"
-                }
-            } catch {}
-        }
-        # Check for final signal (completion/failure)
-        if (Test-Path $SignalFilePath) {
-            $script:pollTimer.Stop()
-            Write-ProgLog "Signal received"
-            try {
-                $signalData = Get-Content $SignalFilePath -Raw | ConvertFrom-Json
-                $pBar = $window.FindName("ProgressBar")
-                $sText = $window.FindName("StatusText")
-                $pBar.IsIndeterminate = $false
-                $pBar.Value = 100
-                if ($signalData.Success -eq $true) {
-                    $sText.Text = "Update complete!"
-                } else {
-                    $sText.Text = "Update could not be completed."
-                }
-                # Hide close button during completion display
-                $window.FindName("CloseButton").Visibility = [System.Windows.Visibility]::Collapsed
-            } catch {
-                Write-ProgLog "Error reading signal: $($_.Exception.Message)"
-                $window.FindName("StatusText").Text = "Update complete!"
-            }
-            $script:closeTimer = [System.Windows.Threading.DispatcherTimer]::new()
-            $script:closeTimer.Interval = [TimeSpan]::FromSeconds(3)
-            $script:closeTimer.Add_Tick({
-                $script:closeTimer.Stop()
-                $window.Close()
-            })
-            $script:closeTimer.Start()
-        } elseif (((Get-Date) - $script:progressStartTime).TotalMinutes -gt 5) {
-            $script:pollTimer.Stop()
-            Write-ProgLog "Timeout - closing"
-            $window.Close()
-        }
-    })
-    $script:pollTimer.Start()
-
-    Write-ProgLog "Showing dialog..."
-    $window.Activate()
-    $window.ShowDialog() | Out-Null
-    Write-ProgLog "Dialog closed"
-
-} catch {
-    Write-ProgLog "ERROR: $($_.Exception.Message)"
-}
-Write-ProgLog "=== UPGRADE PROGRESS DIALOG ENDED ==="
-'@
-
-        $scriptContent | Set-Content -Path $scriptPath -Encoding UTF8
-
-        # Build args with encoded display name to avoid quoting issues
-        $encodedName = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($escapedName))
-        $psArgs = "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -SignalFilePath `"$signalFile`" -AppDisplayName `"$displayName`" -VersionInfo `"$versionText`""
-        $launch = New-HiddenLaunchAction -PowerShellArguments $psArgs -VbsDirectory $userTempPath -AllowUI
-        if ($launch) {
-            $action = $launch.Action
         } else {
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -SignalFilePath `"$signalFile`" -AppDisplayName `"$displayName`" -VersionInfo `"$versionText`""
+            Write-Log "Show-UpgradeProgressNotification: dialog host not alive - skipping progress UI for $displayName" | Out-Null
         }
-
-        $principal = $null
-        foreach ($userFormat in @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")) {
-            try {
-                $principal = New-ScheduledTaskPrincipal -UserId $userFormat -LogonType Interactive -RunLevel Limited
-                break
-            } catch { continue }
-        }
-
-        if ($principal) {
-            $taskName = "UpgradeProgress_$progressId"
-            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-            $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings
-            Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
-            Start-ScheduledTask -TaskName $taskName
-            Write-Log "Launched informational progress dialog (task: $taskName)" | Out-Null
-
-            # Don't block - return signal file path immediately
-            # Cleanup will happen after upgrade completes (caller writes signal, dialog closes)
-            # Schedule async cleanup after a generous timeout
-            $statusFile = $signalFile -replace '\.json$', '_Status.txt'
-            Start-Job -ScriptBlock {
-                param($tn, $sp, $vp, $sf, $stf)
-                Start-Sleep -Seconds 330  # 5.5 min - after dialog's 5-min timeout
-                Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
-                Remove-Item $sp -Force -ErrorAction SilentlyContinue
-                if ($vp) { Remove-Item $vp -Force -ErrorAction SilentlyContinue }
-                Remove-Item $sf -Force -ErrorAction SilentlyContinue
-                Remove-Item $stf -Force -ErrorAction SilentlyContinue
-            } -ArgumentList $taskName, $scriptPath, $launch.VbsPath, $signalFile, $statusFile | Out-Null
-
-            return $signalFile
-        } else {
-            Write-Log "Could not create principal for progress notification" | Out-Null
-            Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-            if ($launch -and $launch.VbsPath) { Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue }
-            return $null
-        }
-
+        return $null
     } catch {
         Write-Log "Error in Show-UpgradeProgressNotification: $($_.Exception.Message)" | Out-Null
-        Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-        if ($launch -and $launch.VbsPath) { Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue }
         return $null
     }
 }
@@ -3116,16 +2864,11 @@ function Write-InfoDialogStatus {
         [string]$SignalFilePath,
         [string]$Status
     )
-    # v9.33: route through persistent dialog host when alive, regardless of SignalFilePath
+    # v9.63: host-only. SignalFilePath param retained for caller-signature stability
+    # but no longer consulted - the legacy file-signal path is gone.
     if (Test-DialogHostAlive) {
         Send-DialogCommand -Cmd "status" -Payload @{ text = $Status } | Out-Null
-        return
     }
-    if (-not $SignalFilePath) { return }
-    try {
-        $statusFile = $SignalFilePath -replace '\.json$', '_Status.txt'
-        $Status | Out-File -FilePath $statusFile -Encoding UTF8 -NoNewline
-    } catch {}
 }
 
 function Invoke-WingetWithProgress {
@@ -3329,11 +3072,11 @@ function Invoke-WingetWithProgress {
 function Show-CompletionNotification {
     <#
     .SYNOPSIS
-        Shows a completion notification that auto-closes after 5 seconds
+        Sends a per-app completion notification to the persistent dialog host.
     .DESCRIPTION
-        Displays an informational notification when an upgrade completes successfully.
-        v9.33: if the persistent dialog host is alive, sends a `complete` command to it
-        instead of spawning a per-app scheduled task; falls back to legacy spawn otherwise.
+        v9.63: legacy scheduled-task spawn paths removed. Host is required - if the
+        host is not alive the notification is logged and silently skipped (this is
+        purely informational, no user action expected).
     #>
     param(
         [string]$AppName,
@@ -3344,31 +3087,21 @@ function Show-CompletionNotification {
     try {
         $displayName = if (-not [string]::IsNullOrEmpty($FriendlyName)) { $FriendlyName } else { $AppName }
 
-        # v9.33: persistent dialog host path
-        if (Test-DialogHostAlive) {
-            $sent = Send-DialogCommand -Cmd "complete" -Payload @{
-                app = $displayName
-                success = $Success
-                title = if ($Success) { "Update complete" } else { "Update could not be completed" }
-                body = $displayName
-            }
-            if ($sent) {
-                # v9.59: dwell briefly so the user actually sees the per-app completion panel.
-                # Without this the next app's `transition` arrives within ms and v9.48's hide-timer
-                # cancellation swaps the panel before the green icon registers visually.
-                Start-Sleep -Seconds 2
-                return
-            }
-            # fall through to legacy on host send failure
+        if (-not (Test-DialogHostAlive)) {
+            Write-Log "Show-CompletionNotification: dialog host not alive - skipping notification for $displayName" | Out-Null
+            return
         }
 
-        if (Test-RunningAsSystem) {
-            # System context - use scheduled task approach
-            Invoke-SystemCompletionNotification -AppName $displayName
-        } else {
-            # Direct user context
-            Show-DirectCompletionNotification -AppName $displayName
-        }
+        Send-DialogCommand -Cmd "complete" -Payload @{
+            app = $displayName
+            success = $Success
+            title = if ($Success) { "Update complete" } else { "Update could not be completed" }
+            body = $displayName
+        } | Out-Null
+        # v9.59: dwell briefly so the user actually sees the per-app completion panel
+        # before the next app's `transition` swaps the content (v9.48 cancels the
+        # hide-timer on the next non-lifecycle command).
+        Start-Sleep -Seconds 2
     } catch {
         Write-Log "Error showing completion notification: $($_.Exception.Message)" | Out-Null
     }
@@ -3761,38 +3494,28 @@ function Show-MandatoryUpdateDialog {
     )
 
     try {
-        # v9.33: persistent dialog host path
-        # v9.36: only commit to "Continue" when we get a valid reply. If the host dies mid-prompt
-        # (Send-DialogCommand returns $null), fall through to the legacy spawn below so the user
-        # still gets a visible prompt rather than a silent proceed.
-        if (Test-DialogHostAlive) {
-            $parts = $Question -split '\|', 2
-            $versionInfo = if ($parts.Count -ge 1) { $parts[0] } else { "" }
-            $bodyText = if ($parts.Count -ge 2) { $parts[1] } else { $Question }
-            $reply = Send-DialogCommand -Cmd "prompt-mandatory" -Payload @{
-                title = $Title
-                versionInfo = $versionInfo
-                body = $bodyText
-                timeoutSec = $TimeoutSeconds
-            } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
-            if ($reply) {
-                # "upgrade" (clicked) or "timeout" (waited it out) -> both mean proceed
-                return "Continue"
-            }
-            Write-Log "Show-MandatoryUpdateDialog: dialog host died mid-prompt - falling back to legacy spawn" | Out-Null
-            # fall through
+        # v9.63: host-only. No legacy fallback - if the host isn't alive the prompt
+        # cannot be shown, so we default to "Continue" (mandatory updates always
+        # proceed eventually; deferring would just leave the task on the list).
+        if (-not (Test-DialogHostAlive)) {
+            Write-Log "Show-MandatoryUpdateDialog: dialog host not alive - defaulting to Continue" | Out-Null
+            return "Continue"
         }
-
-        if (Test-RunningAsSystem) {
-            # System context - use scheduled task approach
-            return Invoke-SystemMandatoryUpdatePrompt -Question $Question -Title $Title -TimeoutSeconds $TimeoutSeconds
-        } else {
-            # Direct user context
-            return Show-DirectMandatoryUpdateDialog -Question $Question -Title $Title -TimeoutSeconds $TimeoutSeconds
-        }
+        $parts = $Question -split '\|', 2
+        $versionInfo = if ($parts.Count -ge 1) { $parts[0] } else { "" }
+        $bodyText = if ($parts.Count -ge 2) { $parts[1] } else { $Question }
+        Send-DialogCommand -Cmd "prompt-mandatory" -Payload @{
+            title = $Title
+            versionInfo = $versionInfo
+            body = $bodyText
+            timeoutSec = $TimeoutSeconds
+        } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30) | Out-Null
+        # "upgrade" (clicked), "timeout" (waited it out), or $null (host died) all
+        # mean proceed for a mandatory update.
+        return "Continue"
     } catch {
         Write-Log "Error in Show-MandatoryUpdateDialog: $($_.Exception.Message)" | Out-Null
-        return "Continue"  # Default to continuing with update
+        return "Continue"
     }
 }
 
@@ -4809,128 +4532,51 @@ function Show-DeferralDialog {
         # Determine if process needs to be closed
         $hasBlockingProcess = -not [string]::IsNullOrEmpty($ProcessName)
 
-        # v9.33: persistent dialog host path
-        # v9.36: only commit to host-only behaviour when we get a valid reply. If the host dies
-        # mid-prompt (Send-DialogCommand returns $null), fall through to the legacy WPF dialog
-        # below so the user still gets a visible prompt instead of a silent default action.
-        if (Test-DialogHostAlive) {
-            $versionText = if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
-                "$displayName $CurrentVersion -> $AvailableVersion"
-            } else {
-                "$displayName update available"
-            }
-            if ($DeferralStatus.ForceUpdate) {
-                # Forced update - route as prompt-mandatory; both "upgrade" and "timeout" mean proceed
-                $reply = Send-DialogCommand -Cmd "prompt-mandatory" -Payload @{
-                    title = "Required Update: $displayName"
-                    versionInfo = $versionText
-                    body = if ($hasBlockingProcess) { "$displayName must be closed to install this update." } else { [string]$DeferralStatus.Message }
-                    timeoutSec = $TimeoutSeconds
-                } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
-                if ($reply) {
-                    return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $hasBlockingProcess }
-                }
-                Write-Log "Show-DeferralDialog: dialog host died mid prompt-mandatory - falling back to legacy spawn" | Out-Null
-            } else {
-                # Deferrable - route as prompt-deferral
-                $daysLeft = if ($DeferralStatus.PSObject.Properties['DaysRemaining']) { [int]$DeferralStatus.DaysRemaining } elseif ($DeferralStatus.PSObject.Properties['MaxDeferralDays']) { [int]$DeferralStatus.MaxDeferralDays } else { $null }
-                # v9.60: warn the user that Update Now will close the running app, so they
-                # can save their work first. Only relevant when a blocking process is active.
-                $closeWarning = if ($hasBlockingProcess) { "`n`nClicking " + [char]0x201C + "Update Now" + [char]0x201D + " will close $displayName - please save your work first." } else { "" }
-                $reply = Send-DialogCommand -Cmd "prompt-deferral" -Payload @{
-                    title = "Update Available: $displayName"
-                    body = $versionText + "`n`n" + [string]$DeferralStatus.Message + $closeWarning
-                    daysLeft = $daysLeft
-                    canDefer = ($DeferralStatus.CanDefer -eq $true)
-                    timeoutSec = $TimeoutSeconds
-                } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
-                if ($reply -and $reply.response) {
-                    $choice = [string]$reply.response
-                    if ($choice -eq "defer") {
-                        return @{ Action = "Defer"; DeferralDays = 1; CloseProcess = $false }
-                    }
-                    return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $hasBlockingProcess }
-                }
-                Write-Log "Show-DeferralDialog: dialog host died mid prompt-deferral - falling back to legacy spawn" | Out-Null
-            }
-            # fall through to legacy WPF dispatcher below
+        # v9.63: host-only. If the host isn't alive we can't ask the user, so default
+        # to "Update" (proceed) - leaving the app skipped indefinitely would just stack
+        # tasks every cycle.
+        if (-not (Test-DialogHostAlive)) {
+            Write-Log "Show-DeferralDialog: dialog host not alive - defaulting to Update for $displayName" | Out-Null
+            return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $hasBlockingProcess }
         }
-        
-        # Build dialog content
-        $versionText = ""
-        if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
-            $versionText = "$displayName $CurrentVersion -> $AvailableVersion update available`n`n"
-        } else {
-            $versionText = "Update available for $displayName`n`n"
-        }
-        
-        # v9.60: legacy WPF fallback also gets the save-your-work warning when the app is open.
-        $processText = if ($hasBlockingProcess) {
-            "$displayName is currently running and must be closed to proceed with the update.`nPlease save your work before clicking Update Now.`n`n"
-        } else {
-            ""
-        }
-        
-        $deferralText = if ($DeferralStatus.ForceUpdate) {
-            $DeferralStatus.Message
-        } else {
-            "$($DeferralStatus.Message)`n`nYou can choose to:"
-        }
-        
-        $question = $versionText + $processText + $deferralText
-        
-        # Create enhanced WPF dialog with deferral options
-        if ($DeferralStatus.ForceUpdate) {
-            # Force update - show mandatory update dialog with only Continue button
-            $title = "Required Update: $displayName"
-            
-            # Create clean, user-friendly message components
-            $versionInfo = ""
-            $actionMessage = ""
-            
-            if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
-                $versionInfo = "$displayName $CurrentVersion -> $AvailableVersion"
-            } else {
-                $versionInfo = "$displayName update available"
-            }
-            
-            if ($hasBlockingProcess) {
-                $actionMessage = "$displayName must be closed to install this update."
-            } else {
-                $actionMessage = "This security/compatibility update cannot be postponed."
-            }
-            
-            # Pass separate components instead of combined question
-            $response = Show-MandatoryUpdateDialog -Question "$versionInfo|$actionMessage" -Title $title -TimeoutSeconds $TimeoutSeconds -HasBlockingProcess $hasBlockingProcess
 
-            # $response is the progress signal file path (if system context) so the dialog can show progress in-place
-            $result = @{
-                Action = "Update"
-                DeferralDays = 0
-                CloseProcess = $true
-            }
-            if ($response -and $response -ne "Continue" -and (Test-Path (Split-Path $response -Parent) -ErrorAction SilentlyContinue)) {
-                $result.ProgressSignalFile = $response
-            }
-            return $result
+        $versionText = if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
+            "$displayName $CurrentVersion -> $AvailableVersion"
         } else {
-            # Show deferral options
-            $title = "Update Available: $displayName"
-            
-            # Create complex dialog with deferral buttons
-            $deferralChoice = Show-EnhancedDeferralDialog -Question $question -Title $title -HasBlockingProcess $hasBlockingProcess -TimeoutSeconds $TimeoutSeconds
-            
-            return $deferralChoice
+            "$displayName update available"
         }
-        
+
+        if ($DeferralStatus.ForceUpdate) {
+            # Forced update - route as prompt-mandatory; both "upgrade" and "timeout" mean proceed
+            Send-DialogCommand -Cmd "prompt-mandatory" -Payload @{
+                title = "Required Update: $displayName"
+                versionInfo = $versionText
+                body = if ($hasBlockingProcess) { "$displayName must be closed to install this update." } else { [string]$DeferralStatus.Message }
+                timeoutSec = $TimeoutSeconds
+            } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30) | Out-Null
+            return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $hasBlockingProcess }
+        }
+
+        # Deferrable - route as prompt-deferral
+        $daysLeft = if ($DeferralStatus.PSObject.Properties['DaysRemaining']) { [int]$DeferralStatus.DaysRemaining } elseif ($DeferralStatus.PSObject.Properties['MaxDeferralDays']) { [int]$DeferralStatus.MaxDeferralDays } else { $null }
+        # v9.60: warn the user that Update Now will close the running app, so they
+        # can save their work first. Only relevant when a blocking process is active.
+        $closeWarning = if ($hasBlockingProcess) { "`n`nClicking " + [char]0x201C + "Update Now" + [char]0x201D + " will close $displayName - please save your work first." } else { "" }
+        $reply = Send-DialogCommand -Cmd "prompt-deferral" -Payload @{
+            title = "Update Available: $displayName"
+            body = $versionText + "`n`n" + [string]$DeferralStatus.Message + $closeWarning
+            daysLeft = $daysLeft
+            canDefer = ($DeferralStatus.CanDefer -eq $true)
+            timeoutSec = $TimeoutSeconds
+        } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
+        if ($reply -and $reply.response -eq "defer") {
+            return @{ Action = "Defer"; DeferralDays = 1; CloseProcess = $false }
+        }
+        return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $hasBlockingProcess }
+
     } catch {
         Write-Log "Error in Show-DeferralDialog: $($_.Exception.Message)" | Out-Null
-        # Return safe default
-        return @{
-            Action = "Update"
-            DeferralDays = 0
-            CloseProcess = $true
-        }
+        return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
     }
 }
 
@@ -5892,195 +5538,24 @@ function Show-VersionSkipDialog {
     try {
         $displayName = if ($FriendlyName) { $FriendlyName } else { $AppName }
 
-        # v9.33: persistent dialog host path
-        # v9.36: only commit to the host's reply when we get one. If the host dies mid-prompt,
-        # fall through to legacy spawn so the user still sees a Skip/Retry choice.
-        if (Test-DialogHostAlive) {
-            $reply = Send-DialogCommand -Cmd "prompt-skip" -Payload @{
-                app = $displayName
-                failures = $FailureCount
-                body = "Version $Version has failed $FailureCount times. Skip this version, or retry next cycle?"
-                timeoutSec = $TimeoutSeconds
-            } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
-            if ($reply -and $reply.response) {
-                return ([string]$reply.response -eq "skip")
-            }
-            Write-Log "Show-VersionSkipDialog: dialog host died mid-prompt - falling back to legacy spawn" | Out-Null
-            # fall through
-        }
-
-        $userInfo = Get-InteractiveUser
-        if (-not $userInfo) {
-            Write-Log "No interactive user - cannot show skip dialog for $AppName" | Out-Null
+        # v9.63: host-only. If the host isn't reachable we default to retry (false) so
+        # the failure counter keeps ticking and the user gets another chance next cycle.
+        if (-not (Test-DialogHostAlive)) {
+            Write-Log "Show-VersionSkipDialog: dialog host not alive - defaulting to retry for $displayName" | Out-Null
             return $false
         }
-
-        $promptId     = [System.Guid]::NewGuid().ToString().Substring(0, 8)
-        $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
-        $responseFile = Join-Path $userTempPath "SkipPrompt_$promptId`_Response.json"
-        $scriptPath   = Join-Path $userTempPath "Show-SkipPrompt_$promptId.ps1"
-
-        $timesWord = if ($FailureCount -eq 1) { "time" } else { "times" }
-        $message   = "$displayName $Version has failed to install $FailureCount $timesWord.`nSkip this version until a newer one becomes available?"
-        $title     = "Update Failed - $displayName"
-
-        $encodedMessage = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($message))
-        $encodedTitle   = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($title))
-
-        $scriptContent = @'
-param(
-    [string]$ResponseFilePath,
-    [string]$EncodedMessage,
-    [string]$EncodedTitle,
-    [int]$TimeoutSeconds = 60
-)
-$logPath = Join-Path $env:TEMP "SkipPrompt_Debug.log"
-function Write-SkipLog { param([string]$m); "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'))] $m" | Out-File -FilePath $logPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue }
-
-try {
-    Write-SkipLog "=== SKIP PROMPT SCRIPT STARTED ==="
-    $msg = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedMessage))
-    $ttl = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedTitle))
-
-    $isDark = $true
-    try {
-        $t = Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name AppsUseLightTheme -ErrorAction Stop
-        $isDark = $t.AppsUseLightTheme -eq 0
-    } catch {}
-    if ($isDark) {
-        $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $textColor = "#FFCCCCCC"; $shadowOpacity = "0.6"; $closeFg = "#FF888888"
-    } else {
-        $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $textColor = "#FF1B1B1B"; $shadowOpacity = "0.25"; $closeFg = "#FF999999"
-    }
-
-    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
-    $workArea    = [System.Windows.SystemParameters]::WorkArea
-    $dialogWidth = 480
-    $escapedMsg  = [System.Security.SecurityElement]::Escape($msg) -replace "`n", "&#10;"
-    $escapedTtl  = [System.Security.SecurityElement]::Escape($ttl)
-
-    $xaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="$escapedTtl" Width="$dialogWidth" SizeToContent="Height" WindowStartupLocation="Manual"
-        ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
-    <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
-        <Border.Effect><DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/></Border.Effect>
-        <Grid>
-            <Grid Margin="20">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
-                </Grid.RowDefinitions>
-                <TextBlock Grid.Row="0" Text="$escapedMsg" Foreground="$textColor" TextWrapping="Wrap" Margin="0,0,24,20" FontSize="12"/>
-                <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Center">
-                    <Button Name="SkipButton"  Content="Skip this version" Width="130" Height="28" Margin="0,0,8,0"/>
-                    <Button Name="RetryButton" Content="Try again later"   Width="130" Height="28" Background="#FF0078D4" Foreground="White" IsDefault="True"/>
-                </StackPanel>
-            </Grid>
-            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0" Background="Transparent" Foreground="$closeFg" BorderThickness="0" FontSize="13" Cursor="Hand"/>
-        </Grid>
-    </Border>
-</Window>
-"@
-
-    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
-    $window = [Windows.Markup.XamlReader]::Load($reader)
-    $window.Left = $workArea.Right - $dialogWidth - 20
-    $window.Top  = $workArea.Bottom - 220
-
-    $writeResponse = { param($skip) @{ Skip = $skip } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8 }
-
-    $window.FindName("SkipButton").Add_Click({
-        Write-SkipLog "Skip button clicked"
-        & $writeResponse $true
-        $window.Close()
-    })
-    $window.FindName("RetryButton").Add_Click({
-        Write-SkipLog "Retry button clicked"
-        & $writeResponse $false
-        $window.Close()
-    })
-    $window.FindName("CloseButton").Add_Click({
-        Write-SkipLog "Close button clicked"
-        & $writeResponse $false
-        $window.Close()
-    })
-
-    $script:elapsed = 0
-    $timer = [System.Windows.Threading.DispatcherTimer]::new()
-    $timer.Interval = [TimeSpan]::FromSeconds(1)
-    $timer.Add_Tick({
-        $script:elapsed++
-        if ($script:elapsed -ge $TimeoutSeconds) {
-            Write-SkipLog "Timeout - defaulting to retry"
-            & $writeResponse $false
-            $window.Close()
+        $reply = Send-DialogCommand -Cmd "prompt-skip" -Payload @{
+            app = $displayName
+            failures = $FailureCount
+            body = "Version $Version has failed $FailureCount times. Skip this version, or retry next cycle?"
+            timeoutSec = $TimeoutSeconds
+        } -Blocking -TimeoutSeconds ($TimeoutSeconds + 30)
+        if ($reply -and $reply.response) {
+            return ([string]$reply.response -eq "skip")
         }
-    })
-    $timer.Start()
-    Write-SkipLog "Showing dialog..."
-    $window.ShowDialog() | Out-Null
-    $timer.Stop()
-    Write-SkipLog "Dialog closed"
-} catch {
-    Write-SkipLog "ERROR: $_"
-    @{ Skip = $false } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
-}
-'@
-
-        $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8 -Force
-
-        $psArgs   = "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" " +
-                    "-ResponseFilePath `"$responseFile`" " +
-                    "-EncodedMessage `"$encodedMessage`" -EncodedTitle `"$encodedTitle`" " +
-                    "-TimeoutSeconds $TimeoutSeconds"
-        $taskName = "SkipPrompt_$promptId"
-        $launch   = New-HiddenLaunchAction -PowerShellArguments $psArgs -VbsDirectory $userTempPath -AllowUI
-
-        $principal = New-ScheduledTaskPrincipal -UserId $userInfo.FullName -LogonType Interactive -RunLevel Limited
-        $settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
-        $task      = New-ScheduledTask -Action $launch.Action -Principal $principal -Settings $settings
-        Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
-        Start-ScheduledTask -TaskName $taskName
-        Write-Log "Skip version dialog launched (task: $taskName)" | Out-Null
-
-        # Wait for user response
-        $deadline = (Get-Date).AddSeconds($TimeoutSeconds + 15)
-        while (-not (Test-Path $responseFile) -and (Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 2
-        }
-
-        $skipChoice = $false
-        if (Test-Path $responseFile) {
-            try {
-                $response   = Get-Content $responseFile -Raw | ConvertFrom-Json
-                $skipChoice = ($response.Skip -eq $true)
-                Write-Log "Skip dialog response received: Skip=$skipChoice" | Out-Null
-            } catch {
-                Write-Log "Error reading skip dialog response: $($_.Exception.Message)" | Out-Null
-            }
-        } else {
-            Write-Log "Skip dialog timed out - defaulting to retry" | Out-Null
-        }
-
-        # Cleanup
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        Remove-Item $scriptPath   -Force -ErrorAction SilentlyContinue
-        Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
-        if ($launch.VbsPath) { Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue }
-
-        return $skipChoice
-
+        return $false
     } catch {
         Write-Log "Error showing skip dialog for $AppName`: $($_.Exception.Message)" | Out-Null
-        if ($taskName) {
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        }
-        Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-        Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
-        if ($launch -and $launch.VbsPath) {
-            Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue
-        }
         return $false
     }
 }
@@ -6088,6 +5563,7 @@ try {
 # ============================================================================
 # END VERSION FAILURE TRACKING SYSTEM
 # ============================================================================
+
 
 function Schedule-UserContextRemediation {
     <#
