@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.66
- Tag: 66
+ Version: 9.67
+ Tag: 67
     
     Version History:
     1.0 - Initial version
@@ -131,6 +131,7 @@
     9.64 - REFACTOR (part 2 of 2): Pure dead-code cleanup. Deleted the 12 orphaned legacy helper functions and their embedded WPF here-strings that became unreachable in v9.63 - New-UserPromptTask, Start-UserPromptTask, Wait-ForUserResponse, Remove-UserPromptTask, Invoke-SystemUserPrompt (and its inline Write-UserLog/Write-ResponseFile/Show-ModernDialog), Show-DirectUserDialog, Show-DirectCompletionNotification, Invoke-SystemCompletionNotification, Show-DirectMandatoryUpdateDialog, Invoke-SystemMandatoryUpdatePrompt, Show-UserDialog, Show-EnhancedDeferralDialog, Show-DirectDeferralDialog, Invoke-SystemDeferralPrompt. Also removed the C:\Temp\wpf-test-trigger.txt diagnostic test path that exercised Invoke-SystemUserPrompt. Remove-StaleScheduledTasks's prefix list keeps the legacy entries (UserPrompt_, UpgradeProgress_, CompletionNotification_, MandatoryPrompt_, DeferralPrompt_, SkipPrompt_) so machines upgrading from pre-v9.64 still sweep any stale tasks created by the old code. Remove-OldTempFiles regex left as-is for the same reason. Diff: 3004 lines deleted, file went from 8683 to 5679 lines (35% smaller). Parser-check passes.
     9.65 - FIX: Manual admin-user run silently force-closed the blocking process instead of prompting. Reported in field 2026-05-18: running the script from an elevated Windows Terminal session committed suicide a few seconds in - the only user-scoped task was Microsoft.WindowsTerminal, Show-DeferralDialog logged "dialog host not alive - defaulting to Update", and Stop-Process killed the very Terminal hosting the running PowerShell. Root cause: Start-DialogHost was gated on Test-RunningAsSystem only (a SYSTEM-only path for Intune runs), so manual user-admin invocations never started the host. Combined with v9.63's removal of the legacy per-dialog fallback, Show-DeferralDialog's no-host branch returned Action=Update straight away. New $Script:OwnsDialogHost flag is set true when (a) not a -UserRemediationOnly handoff, (b) not connecting to an existing session via -DialogSessionId, and (c) running as SYSTEM OR as an interactive admin (with a desktop session). The three Start-DialogHost / Stop-DialogHost call sites now share this flag so the start and stop guards stay in sync, and an admin running the script by hand gets the same prompt experience SYSTEM gets via Intune.
     9.66 - FIX: Manual admin runs were dropping every machine-scoped task on the floor. Reported in field 2026-05-18: a task file with 6 machine-scoped entries (Google.Chrome, Microsoft.VCRedist.2015+.x86, Microsoft.DotNet.SDK.8, Microsoft.VCRedist.2015+.x64, Microsoft.DotNet.DesktopRuntime.8, Microsoft.DotNet.DesktopRuntime.9) produced "0 routed to user context, 6 left for the other context" and the run exited with no work done. Root cause: scope routing assumed the user context only ever runs as an Intune-spawned handoff after SYSTEM has already processed machine-scoped entries, so the allowed-scopes list for user context was @("user", "unknown"). Manual admin runs aren't preceded by a SYSTEM pass - there's no "other context" to defer machine work to - but the admin token can drive machine-wide winget upgrades just fine on its own. New $isManualAdmin flag (not SYSTEM, not -UserRemediationOnly, $userIsAdmin) widens the allowed scopes to @("machine", "user", "unknown") for that path so a hand-launched admin run actually processes the full task file. Also: replaced the stale "No upgrades found in winget output" log line at the empty-list exit with "No work for this context (task file routed all entries to another context, or task file empty)" - the winget-discovery code path was removed in v9.21 but the misleading message survived. And $contextLabel now reads "user (admin manual)" for the new branch to distinguish it from Intune user-context handoffs in the log.
+    9.67 - FIX: Azure AD UPN lookup always returned "N/A" under Intune Remediations. Field repro 2026-05-18: log shows "Azure AD identity cache path does not exist (user may be local account)" even though the device is Azure AD-joined and HKLM:\SOFTWARE\Microsoft\IdentityStore\Cache\<SID>\IdentityCache\<SID> exists with UserName=henrik@cloudonly.dk. Same WoW64 trap remediate v9.42 / detect v5.51 fixed for HKLM:\SOFTWARE\AppUpdater - Intune Remediations default to a 32-bit PowerShell host (C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe) and PSDrive registry access (Test-Path HKLM:\SOFTWARE\X, Get-ItemProperty HKLM:\SOFTWARE\X) silently passes through the WoW64 redirector, rewriting HKLM:\SOFTWARE\Microsoft\IdentityStore to HKLM:\SOFTWARE\WOW6432Node\Microsoft\IdentityStore. IdentityStore is a 64-bit-only key with no WOW6432Node mirror, so Test-Path returns False and the lookup never runs. Replaced the PSDrive Test-Path + Get-ItemProperty pair with [Microsoft.Win32.RegistryKey]::OpenBaseKey(LocalMachine, Registry64).OpenSubKey(...).GetValue('UserName'), same pattern as the AppRegBase helpers - bypasses the redirector and reads the natural 64-bit view regardless of host bitness. UPN now resolves correctly, so anything downstream that branches on $userInfo.AzureADUser actually gets the value. detect.ps1 doesn't have this code path so no detect change needed.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -1311,25 +1312,35 @@ function Get-InteractiveUser {
             }
             Write-Log "User detection method: $detectionMethod -> $loggedInUser, SID=$LoggedSID" | Out-Null
             
-            # Try to get Azure AD username from registry with enhanced error suppression
+            # v9.67: read Azure AD UPN via OpenBaseKey(Registry64) to bypass the WoW64 redirector.
+            # Intune Remediations launch this script in a 32-bit PowerShell host (SysWOW64), and the
+            # PSDrive form HKLM:\SOFTWARE\Microsoft\IdentityStore\... gets silently rewritten to
+            # HKLM:\SOFTWARE\WOW6432Node\Microsoft\IdentityStore\..., which doesn't exist - IdentityStore
+            # is a 64-bit-only key with no WOW6432Node mirror. Test-Path returned $false and the lookup
+            # never ran. Same trap v9.42 fixed for HKLM:\SOFTWARE\AppUpdater via the AppRegBase helpers.
+            $azureAdSubPath = "SOFTWARE\Microsoft\IdentityStore\Cache\$LoggedSID\IdentityCache\$LoggedSID"
+            $CurrentAzureADUser = $null
             try {
-                $azureAdPath = "HKLM:\SOFTWARE\Microsoft\IdentityStore\Cache\$LoggedSID\IdentityCache\$LoggedSID"
-                Write-Log "Checking for Azure AD user info at: $azureAdPath" | Out-Null
-                
-                # First check if the path exists to avoid errors completely
-                if (Test-Path $azureAdPath) {
-                    $registryData = Get-ItemProperty -Path $azureAdPath -Name UserName -ErrorAction SilentlyContinue
-                    if ($registryData -and $registryData.UserName) {
-                        $CurrentAzureADUser = $registryData.UserName
-                        Write-Log "Found Azure AD username: $CurrentAzureADUser" | Out-Null
+                Write-Log "Checking for Azure AD user info at: HKLM:\$azureAdSubPath (64-bit view)" | Out-Null
+                $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                    [Microsoft.Win32.RegistryHive]::LocalMachine,
+                    [Microsoft.Win32.RegistryView]::Registry64)
+                try {
+                    $azureAdKey = $hklm.OpenSubKey($azureAdSubPath, $false)
+                    if ($azureAdKey) {
+                        try {
+                            $userName = $azureAdKey.GetValue('UserName')
+                            if ($userName) {
+                                $CurrentAzureADUser = [string]$userName
+                                Write-Log "Found Azure AD username: $CurrentAzureADUser" | Out-Null
+                            } else {
+                                Write-Log "Azure AD identity cache key exists but UserName value not present" | Out-Null
+                            }
+                        } finally { $azureAdKey.Close() }
                     } else {
-                        Write-Log "Azure AD path exists but UserName property not found" | Out-Null
-                        $CurrentAzureADUser = $null
+                        Write-Log "Azure AD identity cache key does not exist at HKLM:\$azureAdSubPath (user may be local account)" | Out-Null
                     }
-                } else {
-                    Write-Log "Azure AD identity cache path does not exist (user may be local account)" | Out-Null
-                    $CurrentAzureADUser = $null
-                }
+                } finally { $hklm.Close() }
             } catch {
                 Write-Log "No Azure AD user info available (user may be local): $($_.Exception.Message)" | Out-Null
                 $CurrentAzureADUser = $null
