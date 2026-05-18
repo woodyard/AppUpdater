@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.61
-    Tag: 91
+    Version: 5.62
+    Tag: 92
     
     Version History:
     1.0 - Initial version
@@ -108,6 +108,7 @@
     5.59 - FIX: When SYSTEM's winget upgrade returned 0 apps the script exited immediately without ever scheduling the user-context detection task. Per-user installs (Claude desktop, OhMyPosh, MSIX/Store apps, Bicep) are often invisible to SYSTEM's profile, so SYSTEM seeing zero doesn't mean "nothing to upgrade" - it can mean "nothing visible to me". The early-exit hid user-only upgrades from every cycle that happened to have no machine-scope work. Gate widened: if SYSTEM is the runner AND an interactive session is present AND we're not the user-detection task ourselves, the flow now enters the main branch (which already merges SYSTEM + user-context listings and handles 0 system apps gracefully). The user-context task runs, returns whatever per-user apps it sees, and those become the work list. If user-context also returns 0, the existing 0-apps exit path fires as before.
     5.60 - FIX: Get-AppInstalledScope now adds a SYSTEM-side visibility probe AFTER it resolves to "machine". An app can be correctly machine-scoped (Program Files install, real HKLM Uninstall entry) yet still un-upgradeable from SYSTEM context, because winget's catalog-Id <-> installed-binary binding lives in per-user LocalState (%LOCALAPPDATA%\Packages\Microsoft.DesktopAppInstaller_*). SYSTEM's LocalState is empty for apps the user installed via `winget install`, so `winget list --id X --exact` from SYSTEM returns nothing even when the app is genuinely installed (Git.Git is the canonical case - confirmed by PsExec -s test). Probe: when SYSTEM detects "machine", run `winget list --id X --exact --source winget` from SYSTEM. If the output doesn't contain the AppID, downgrade to "unknown" - that routes through remediate.ps1 v9.49's user-context retry handoff, where the user's own winget LocalState has the binding. Decision-by tag in the log now appends "+invisible-to-system" so the probe firing is traceable. Cost: one extra ~1-2s winget call per machine-detected app, only paid in SYSTEM-context detection. Pairs with remediate.ps1 v9.54.
     5.61 - TUNE: User-context detection timeout bumped from 90 s to 180 s. Field report 2026-05-18: H-SURFACELAP5's first detect run timed out at 90 s waiting for the user-context scheduled task result, the second run (~7 min later, task warm) completed in ~70 s. The 90 s timeout pushed total detect runtime past 3 minutes, which collided with IME's housekeeping of C:\WINDOWS\IMECache\HealthScripts\<guid>_<rev>\ - by the time agentexecutor.exe called DumpResultsToFile to persist the script's exit-1, the directory was gone (DirectoryNotFoundException). agentexecutor.exe swallowed that exception and exited 0, so Intune read "compliant" and never queued remediation despite 7 apps being in the task file. 180 s leaves room for cold starts (task registration + wscript+VBS launcher + PowerShell warmup + whitelist download + winget enumeration) while keeping detect well inside whatever cleanup window IME uses. Subsequent warm runs are unchanged.
+    5.62 - PERF: Parallelised SYSTEM-side work with the user-context child task to shave ~7-15 s off detect runtime and shrink the IME-cleanup race window. Field repro 2026-05-18: a 65 s detect run was racing IME's cleanup of C:\WINDOWS\IMECache\HealthScripts\<guid>_<rev>\ - by the time agentexecutor wrote the detect result and IME's ScriptProcessor went to launch remediate.ps1, IME's own housekeeping had wiped the staging directory, ResultManager.CreateResultFiles threw DirectoryNotFoundException, and remediation was never launched. Split Invoke-UserContextDetection into Start-UserContextDetection (registers and starts the task, returns a state object immediately), Wait-UserContextDetection (polls for the child's result file with timeout), and Remove-UserContextDetection (cleans up task + temp files). SYSTEM main path now kicks off the child task right after $systemApps is built and PRE-COMPUTES per-app InstalledScope on SYSTEM's records during the wait window, instead of doing the scope detection serially inside Write-UpgradeTaskFile after the child finishes. Write-UpgradeTaskFile honours an InstalledScope value pre-set on the input record so it doesn't redo the work. Net: the ~7 s SYSTEM scope-detect overlaps with the ~35 s child task instead of running after it. Backward compat: Invoke-UserContextDetection is kept as a thin Start/Wait/Remove wrapper for any path that still calls it sequentially.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -1212,7 +1213,19 @@ function Write-UpgradeTaskFile {
             }
             # Determine the install scope so remediation can route the upgrade to the right context
             # without re-walking the registry per app.
-            $scope = Get-AppInstalledScope -AppID $appId -FriendlyName $friendly
+            # v5.62: prefer a pre-computed InstalledScope on the record (set by the SYSTEM main
+            # path before the user-context wait so the per-app scope walk can run in parallel
+            # with the child task), fall back to Get-AppInstalledScope when missing so legacy
+            # callers and freshly-merged user records still get scoped.
+            $scope = $null
+            if ($r -is [hashtable] -or $r -is [System.Collections.IDictionary]) {
+                if ($r.Contains('InstalledScope') -and $r['InstalledScope']) { $scope = [string]$r['InstalledScope'] }
+            } elseif ($r.PSObject -and $r.PSObject.Properties['InstalledScope'] -and $r.InstalledScope) {
+                $scope = [string]$r.InstalledScope
+            }
+            if (-not $scope) {
+                $scope = Get-AppInstalledScope -AppID $appId -FriendlyName $friendly
+            }
             $entries += [pscustomobject]@{
                 AppID = $appId
                 FriendlyName = $friendly
@@ -1308,391 +1321,287 @@ function Write-DetectionResults {
     }
 }
 
-function Invoke-UserContextDetection {
+function Start-UserContextDetection {
     <#
     .SYNOPSIS
-        Schedules user context detection and waits for results
+        v5.62: First leg of the split user-context detection. Registers + starts the
+        scheduled task and returns a state object the caller hands to
+        Wait-UserContextDetection and Remove-UserContextDetection.
+    .DESCRIPTION
+        Pre-v5.62, Invoke-UserContextDetection did setup + wait + cleanup back-to-back
+        (~45 s blocking). Splitting it lets SYSTEM-side work (per-app scope detection,
+        ~7 s) run in parallel with the ~35 s child task, shrinking total detect runtime
+        and closing the window where IME's housekeeping wipes the staging directory
+        before remediate.ps1 can be launched.
+    .OUTPUTS
+        Hashtable with TaskName, ResultFile, TempScriptPath, MarkerFile, VbsPath,
+        UserInfo, StartTime, Started. Returns $null if setup or principal creation
+        fails - caller treats that as "no user-context apps will be detected" and
+        continues with SYSTEM-only data.
     #>
-    
+
     try {
-        Write-Log "DEBUG: *** INVOKE-USERCONTEXTDETECTION FUNCTION ENTERED ***" -IsDebug
-        Write-Log "DEBUG: Function starting execution..." -IsDebug
-        Write-Log "Starting user context detection scheduling"
-        
-        # First, let's test if we can manually run winget in user context to verify apps exist
-        Write-Log "DEBUG: Testing direct winget execution in SYSTEM context with --scope user..." -IsDebug
-        try {
-            if ($WingetPath) {
-                $wingetExe = Join-Path $WingetPath "winget.exe"
-                Write-Log "DEBUG: Executing winget --scope user from SYSTEM context..." -IsDebug
-                $testOutput = $(& $wingetExe upgrade --accept-source-agreements --source winget --scope user 2>&1)
-                Write-Log "DEBUG: Direct --scope user test completed, output: $($testOutput.Count) lines" -IsDebug
-                # Show first few lines to see if user apps are visible
-                for ($i = 0; $i -lt [Math]::Min(5, $testOutput.Count); $i++) {
-                    Write-Log "DEBUG: Direct test line $i`: $($testOutput[$i])" -IsDebug
-                }
-                
-                # Check if apps were found in direct test
-                $appsFoundInTest = ($testOutput | Where-Object { $_ -like "*.*" -and $_ -notlike "*No applicable update*" }).Count -gt 0
-                Write-Log "DEBUG: Direct --scope user test found apps: $appsFoundInTest" -IsDebug
-            }
-        } catch {
-            Write-Log "DEBUG: Direct --scope user test failed: $($_.Exception.Message)" -IsDebug
-        }
-        
-        Write-Log "DEBUG: Getting interactive user info..." -IsDebug
+        Write-Log "Starting user context detection (async)"
+
         $userInfo = Get-InteractiveUser
         if (-not $userInfo) {
-            Write-Log "DEBUG: ERROR - No interactive user found - skipping user context detection" -IsDebug
-            return @()
+            Write-Log "No interactive user found - skipping user context detection"
+            return $null
         }
-        Write-Log "DEBUG: Interactive user found: $($userInfo.Username)" -IsDebug
-        
-        # Create detection result file - use shared path accessible to both SYSTEM and USER contexts
+
         $sharedTempPath = "C:\ProgramData\Temp"
         if (-not (Test-Path $sharedTempPath)) {
             New-Item -Path $sharedTempPath -ItemType Directory -Force | Out-Null
         }
         $randomId = Get-Random -Minimum 1000 -Maximum 9999
         $resultFile = Join-Path $sharedTempPath "UserDetection_$randomId.json"
-        Write-Log "DEBUG: *** FILE TRACKING START ***" -IsDebug
-        Write-Log "DEBUG: Generated result filename: UserDetection_$randomId.json" -IsDebug
-        Write-Log "DEBUG: Full result file path: $resultFile" -IsDebug
-        Write-Log "DEBUG: Shared temp directory: $sharedTempPath" -IsDebug
-        Write-Log "DEBUG: Directory exists: $(Test-Path $sharedTempPath)" -IsDebug
-        if (Test-Path $sharedTempPath) {
-            $dirFiles = Get-ChildItem -Path $sharedTempPath -Filter "UserDetection_*.json" -ErrorAction SilentlyContinue
-            Write-Log "DEBUG: Existing UserDetection files in directory: $($dirFiles.Count)" -IsDebug
-            foreach ($file in $dirFiles) {
-                Write-Log "DEBUG: - Existing file: $($file.Name) (size: $($file.Length) bytes, modified: $($file.LastWriteTime))" -IsDebug
-            }
-        }
         Write-Log "User detection result file: $resultFile"
-        Write-Log "Using shared temp path accessible to both SYSTEM and USER contexts: $sharedTempPath"
-        
-        # Create scheduled task for user detection
+
         $taskName = "UserDetection_$(Get-Random -Minimum 1000 -Maximum 9999)"
         $tempScriptName = "availableUpgrades-detect_$(Get-Random -Minimum 1000 -Maximum 9999).ps1"
         $tempScriptPath = Join-Path $sharedTempPath $tempScriptName
-        
-        Write-Log "Copying script to user-accessible location: $tempScriptPath" | Out-Null
-        $sourceSize = (Get-Item $Global:CurrentScriptPath).Length
-        Write-Log "Source script size: $sourceSize bytes" | Out-Null
 
-        # Detect bootstrapper/wrapper scenario (small file that downloads the real script via iex/irm)
+        $sourceSize = (Get-Item $Global:CurrentScriptPath).Length
+        Write-Log "Source script size: $sourceSize bytes"
+
+        # Bootstrapper-wrapper detection: a < 1 KB source means we're running from the Intune
+        # detect.ps1 wrapper that downloads the real script via irm. The user-context child
+        # needs the FULL script, so fetch it from the same URL the wrapper uses.
         if ($sourceSize -lt 1000) {
-            Write-Log "Source appears to be a bootstrapper wrapper ($sourceSize bytes) - downloading full script" | Out-Null
+            Write-Log "Source appears to be a bootstrapper wrapper - downloading full script"
             try {
                 $bootstrapContent = Get-Content $Global:CurrentScriptPath -Raw
-                if ($bootstrapContent -match 'irm\s+[''"]([^''"]+)[''"]') {
+                if ($bootstrapContent -match 'irm\s+[''"]([^''"]+)[''"]' -or $bootstrapContent -match 'Invoke-RestMethod\s+(?:-Uri\s+)?[''"]([^''"]+)[''"]') {
                     $scriptUrl = $Matches[1]
-                    Write-Log "Extracted download URL from bootstrapper: $scriptUrl" | Out-Null
+                    Write-Log "Extracted download URL: $scriptUrl"
                     $fullScript = Invoke-RestMethod -Uri $scriptUrl -ErrorAction Stop
                     $fullScript | Out-File -FilePath $tempScriptPath -Encoding UTF8 -Force
-                    $dlSize = (Get-Item $tempScriptPath).Length
-                    Write-Log "Downloaded full script to temp: $dlSize bytes" | Out-Null
+                    Write-Log "Downloaded full script: $((Get-Item $tempScriptPath).Length) bytes"
                 } else {
-                    Write-Log "ERROR: Could not extract download URL from bootstrapper content" | Out-Null
-                    return @()
+                    Write-Log "ERROR: Could not extract download URL from bootstrapper content"
+                    return $null
                 }
             } catch {
-                Write-Log "ERROR: Failed to download full script from bootstrapper URL: $($_.Exception.Message)" | Out-Null
-                return @()
+                Write-Log "ERROR: Failed to download full script: $($_.Exception.Message)"
+                return $null
             }
         } else {
             Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force
         }
-        
-        $scriptPath = $tempScriptPath
-        
-        # Create a marker file to indicate this is a user detection task (workaround for parameter passing issues)
-        # Include whitelistUrl so the user-context child process uses the same whitelist source
+
+        if (-not (Test-Path $tempScriptPath)) {
+            Write-Log "ERROR: Temp script copy does not exist after copy: $tempScriptPath"
+            return $null
+        }
+
+        # Marker file lets the child know it's a user-detection task and where to write its
+        # result file (parameter passing through scheduled tasks is flaky, hence this workaround).
         $markerFile = "$tempScriptPath.userdetection"
         $markerContent = "USERDETECTION:$resultFile"
         if ($whitelistUrl) {
             $markerContent += "`nWHITELISTURL:$whitelistUrl"
         }
         $markerCreated = New-MarkerFile -FilePath $markerFile -Content $markerContent -Description "User detection task marker"
-        
         if (-not $markerCreated) {
-            Write-Log -Message "ERROR: Failed to create user detection marker file - user detection may not work properly"
+            Write-Log "ERROR: Failed to create user detection marker file - user detection may not work properly"
         }
-        
-        # Create hidden launch action using VBS wrapper (no console window flash)
-        $psArgs = "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
+
+        # Hidden launch via wscript+VBS so no console window flashes when the task fires.
+        $psArgs = "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$tempScriptPath`""
         $launch = New-HiddenLaunchAction -PowerShellArguments $psArgs -VbsDirectory $sharedTempPath
         if (-not $launch) {
-            Write-Log "ERROR: Failed to create hidden launch action - falling back to direct PowerShell"
+            Write-Log "Hidden launch action failed - falling back to direct PowerShell"
             $launch = @{
-                Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
+                Action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$tempScriptPath`""
                 VbsPath = $null
             }
         }
 
-        Write-Log "Creating user detection task: $taskName" | Out-Null
-        Write-Log "Script path: $scriptPath" | Out-Null
-        Write-Log "Launch method: $(if ($launch.VbsPath) { 'VBS hidden launcher' } else { 'Direct PowerShell' })" | Out-Null
-        Write-Log "Result file: $resultFile" | Out-Null
-        Write-Log "Marker file: $markerFile" | Out-Null
-        
-        # Verify script copy exists and is readable
-        if (Test-Path $tempScriptPath) {
-            $scriptSize = (Get-Item $tempScriptPath).Length
-            Write-Log "DEBUG: Temp script exists, size: $scriptSize bytes" -IsDebug
-        } else {
-            Write-Log "ERROR: Temp script copy does not exist: $tempScriptPath" | Out-Null
-            return @()
-        }
-        
-        # Verify result directory is writable
-        $resultDir = Split-Path $resultFile
-        try {
-            $testFile = Join-Path $resultDir "test_$(Get-Random).tmp"
-            "test" | Out-File -FilePath $testFile -Force
-            Remove-Item $testFile -Force
-            Write-Log "DEBUG: Result directory is writable: $resultDir" -IsDebug
-        } catch {
-            Write-Log "ERROR: Result directory not writable: $resultDir - $($_.Exception.Message)" -IsDebug | Out-Null
-        }
-        
-        try {
-            # Use pre-created hidden launch action (VBS wrapper)
-            $action = $launch.Action
-            
-            # Create task principal (run as interactive user)
-            $principal = $null
-            $userFormats = @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")
-            $logonTypes = @("Interactive", "S4U")
-            
-            foreach ($userFormat in $userFormats) {
-                foreach ($logonType in $logonTypes) {
-                    try {
-                        $principal = New-ScheduledTaskPrincipal -UserId $userFormat -LogonType $logonType -RunLevel Limited
-                        Write-Log "Successfully created principal with: $userFormat ($logonType)"
-                        break
-                    } catch {
-                        Write-Log "Failed with format '$userFormat' ($logonType): $($_.Exception.Message)"
-                    }
-                }
-                if ($principal) { break }
-            }
-            
-            if (-not $principal) {
-                Write-Log "DEBUG: ERROR - Could not create task principal with any method"
-                return @()
-            }
-            
-            # Create task settings - match working dialog system approach
-            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd
-            
-            # Create and register the task WITHOUT triggers (same as working dialog system)
-            $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings -Description "User context winget detection"
-            Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
-            Write-Log "Task created successfully: $taskName" | Out-Null
-            
-            # Verify task was created successfully before starting
-            $createdTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-            if (-not $createdTask) {
-                Write-Log "ERROR: Task creation failed - task not found: $taskName" | Out-Null
-                return @()
-            }
-            Write-Log "DEBUG: Task verified to exist: $taskName, State: $($createdTask.State)" -IsDebug | Out-Null
-            
-            # Start the task with enhanced error handling
-            Write-Log "Starting user detection task: $taskName"
-            try {
-                Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
-                Write-Log "DEBUG: Start-ScheduledTask completed successfully" -IsDebug
-                
-                # Verify task actually started and monitor its execution
-                Start-Sleep -Seconds 1
-                $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
-                if ($taskInfo) {
-                    Write-Log "DEBUG: Task info - LastResult: $($taskInfo.LastTaskResult), LastRunTime: $($taskInfo.LastRunTime)" -IsDebug
-                    Write-Log "DEBUG: Task info - NextRunTime: $($taskInfo.NextRunTime), NumberOfMissedRuns: $($taskInfo.NumberOfMissedRuns)" -IsDebug
-                } else {
-                    Write-Log "ERROR: Cannot get task info after start attempt" -IsDebug
-                }
-                
-                # Brief verification that task started, then proceed to file monitoring
-                Start-Sleep -Seconds 2
-                $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
-                if ($taskInfo) {
-                    Write-Log "DEBUG: Task started successfully - LastResult: $($taskInfo.LastTaskResult), LastRunTime: $($taskInfo.LastRunTime)" -IsDebug
-                } else {
-                    Write-Log "DEBUG: Could not get task info after start" -IsDebug
-                }
-                
-            } catch {
-                Write-Log "ERROR: Failed to start scheduled task: $($_.Exception.Message)"
-                return @()
-            }
-            
-            # Wait for results with reduced timeout for faster detection
-            $timeout = 180  # v5.61: bumped from 90 s. First-run cold start of the user-context scheduled task (task registration + wscript+VBS launcher + PowerShell warmup + whitelist download + winget enumeration) exceeded 90 s on slower hardware. When the timeout fires, detect's overall runtime stretches past 3 min and the IME-side cleanup of C:\WINDOWS\IMECache\HealthScripts\<guid>_<rev>\ races agentexecutor's DumpResultsToFile - PowerShell exit 1 is lost and Intune reads exitCode=0 (compliant). Second-run completion is ~70 s once the task is warm; 180 s leaves plenty of headroom for cold starts without dragging detect over the cleanup edge.
-            $startTime = Get-Date
-            $apps = @()
-            
-            Write-Log "DEBUG: *** STARTING FILE WAIT LOOP ***" -IsDebug
-            Write-Log "DEBUG: Listening for file: $resultFile" -IsDebug
-            Write-Log "DEBUG: Timeout: $timeout seconds" -IsDebug
-            Write-Log "DEBUG: Start time: $startTime" -IsDebug
-            Write-Log "Waiting for user detection results (timeout: $timeout seconds)" | Out-Null
-            
-            $waitCount = 0
-            while ((Get-Date) -lt $startTime.AddSeconds($timeout)) {
-                $waitCount++
-                $elapsed = ((Get-Date) - $startTime).TotalSeconds
-                Write-Log "DEBUG: Wait cycle $waitCount (elapsed: $([math]::Round($elapsed, 1))s) - checking for file: $resultFile" -IsDebug
-                
-                if (Test-Path $resultFile) {
-                    Write-Log "DEBUG: *** FILE DETECTED *** - $resultFile found after $([math]::Round($elapsed, 1)) seconds" -IsDebug
-                    try {
-                        Write-Log "DEBUG: Result file found: $resultFile" -IsDebug | Out-Null
-                        $fileSize = (Get-Item $resultFile).Length
-                        Write-Log "DEBUG: Result file size: $fileSize bytes" -IsDebug | Out-Null
-                        
-                        Start-Sleep -Milliseconds 500  # Brief pause to ensure file is fully written
-                        $fileContent = Get-Content $resultFile -Raw
-                        Write-Log "DEBUG: Raw file content: $fileContent" -IsDebug | Out-Null
-                        
-                        $results = $fileContent | ConvertFrom-Json
-                        Write-Log "DEBUG: JSON parsed successfully" -IsDebug | Out-Null
-                        # @() forces array context: PS5.1's ConvertFrom-Json unwraps single-element
-                        # JSON arrays to a bare object, which then has no .Count property.
-                        $apps = @($results.Apps)
-                        Write-Log "DEBUG: Results object - Apps count: $($apps.Count), Context: $($results.Context), Username: $($results.Username)" -IsDebug | Out-Null
-                        Write-Log "User detection completed: $($apps.Count) apps found" | Out-Null
-                        if ($apps.Count -gt 0) {
-                            Write-Log "DEBUG: User context apps found: $(Format-AppList $apps)" -IsDebug | Out-Null
-                        } else {
-                            Write-Log "DEBUG: No apps found in parsed results - Apps array is empty" -IsDebug | Out-Null
-                        }
-                        break
-                    } catch {
-                        Write-Log "Error reading/parsing detection results: $($_.Exception.Message)" | Out-Null
-                        Write-Log "DEBUG: Exception type: $($_.Exception.GetType().FullName)" -IsDebug | Out-Null
-                        if (Test-Path $resultFile) {
-                            $rawContent = Get-Content $resultFile -Raw -ErrorAction SilentlyContinue
-                            Write-Log "DEBUG: Raw file content on error: $rawContent" -IsDebug | Out-Null
-                        }
-                        Start-Sleep -Seconds 2
-                        continue
-                    }
-                } else {
-                    Write-Log "DEBUG: File not found yet (cycle $waitCount) - checking directory contents" -IsDebug
-                    if (Test-Path $sharedTempPath) {
-                        $currentFiles = Get-ChildItem -Path $sharedTempPath -Filter "UserDetection_*.json" -ErrorAction SilentlyContinue
-                        Write-Log "DEBUG: Current UserDetection files in directory: $($currentFiles.Count)" -IsDebug
-                        foreach ($file in $currentFiles) {
-                            Write-Log "DEBUG: - Found file: $($file.Name) (size: $($file.Length) bytes)" -IsDebug
-                        }
-                    }
-                }
-                Start-Sleep -Seconds 2
-            }
-            
-            if ((Get-Date) -ge $startTime.AddSeconds($timeout)) {
-                Write-Log "User detection timed out after $timeout seconds - proceeding with system apps only"
-                
-                # Check final task state to understand what happened
+        # Task principal (run as the interactive user). Try several name formats + logon types
+        # because environments vary in which combination AccountSid resolution accepts.
+        $principal = $null
+        foreach ($userFormat in @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")) {
+            foreach ($logonType in @("Interactive", "S4U")) {
                 try {
-                    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-                    if ($task) {
-                        $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
-                        Write-Log "DEBUG: TIMEOUT - Final task state: $($task.State)" -IsDebug
-                        Write-Log "DEBUG: TIMEOUT - Final task result: $($taskInfo.LastTaskResult)" -IsDebug
-                        Write-Log "DEBUG: TIMEOUT - Task last run: $($taskInfo.LastRunTime)" -IsDebug
-                        
-                        if ($task.State -eq "Running") {
-                            Write-Log "DEBUG: Task still running - stopping it" -IsDebug
-                            Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-                        }
-                    }
+                    $principal = New-ScheduledTaskPrincipal -UserId $userFormat -LogonType $logonType -RunLevel Limited
+                    Write-Log "Successfully created principal with: $userFormat ($logonType)"
+                    break
                 } catch {
-                    Write-Log "DEBUG: Error checking final task state: $($_.Exception.Message)" -IsDebug
+                    Write-Log "DEBUG: Failed to create principal with '$userFormat' ($logonType): $($_.Exception.Message)" -IsDebug
                 }
             }
-            
-        } catch {
-            Write-Log "DEBUG: ERROR - Exception in user detection task: $($_.Exception.Message)" -IsDebug
-            Write-Log "DEBUG: ERROR - Exception type: $($_.Exception.GetType().FullName)" -IsDebug
-            $apps = @()
-        } finally {
-            # Cleanup
-            try {
-                Write-Log "DEBUG: *** STARTING CLEANUP ***" -IsDebug
-                Write-Log "DEBUG: Unregistering scheduled task: $taskName" -IsDebug
-                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-                Write-Log "DEBUG: Task unregistered successfully" -IsDebug
-                
-                if (Test-Path $resultFile) {
-                    Write-Log "DEBUG: *** DELETING RESULT FILE *** - $resultFile" -IsDebug
-                    $fileSize = (Get-Item $resultFile -ErrorAction SilentlyContinue).Length
-                    Write-Log "DEBUG: File size before deletion: $fileSize bytes" -IsDebug
-                    Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
-                    Write-Log "DEBUG: Result file deleted: $resultFile" -IsDebug
-                    # Verify deletion
-                    if (Test-Path $resultFile) {
-                        Write-Log "WARNING: Result file still exists after deletion attempt!"
-                    } else {
-                        Write-Log "DEBUG: Result file deletion confirmed" -IsDebug
-                    }
-                } else {
-                    Write-Log "DEBUG: Result file not found during cleanup: $resultFile" -IsDebug
-                }
-                
-                # Clean up temporary script copy
-                if (Test-Path $tempScriptPath) {
-                    Write-Log "DEBUG: *** DELETING TEMP SCRIPT *** - $tempScriptPath" -IsDebug
-                    Remove-Item $tempScriptPath -Force -ErrorAction SilentlyContinue
-                    Write-Log "Removed temporary script copy: $tempScriptPath" | Out-Null
-                } else {
-                    Write-Log "DEBUG: Temp script not found during cleanup: $tempScriptPath" -IsDebug | Out-Null
-                }
+            if ($principal) { break }
+        }
+        if (-not $principal) {
+            Write-Log "ERROR: Could not create task principal with any name/logon-type combination"
+            return $null
+        }
 
-                # Clean up VBS hidden launcher file
-                if ($launch.VbsPath -and (Test-Path $launch.VbsPath)) {
-                    Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue
-                    Write-Log "Removed VBS hidden launcher: $($launch.VbsPath)" -IsDebug | Out-Null
-                }
-                
-                # Clean up marker file using centralized function
-                $markerFileCleanup = "$tempScriptPath.userdetection"
-                $markerRemoved = Remove-MarkerFile -FilePath $markerFileCleanup -Description "User detection task marker (finally block)"
-                if (-not $markerRemoved) {
-                    Write-Log "WARNING: Failed to clean up marker file during finally block: $markerFileCleanup" | Out-Null
-                }
-                
-                Write-Log "DEBUG: *** CLEANUP COMPLETED ***" -IsDebug
-                Write-Log "User detection cleanup completed" | Out-Null
-            } catch {
-                Write-Log "Error during cleanup: $($_.Exception.Message)" | Out-Null
-            }
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd
+        $task = New-ScheduledTask -Action $launch.Action -Principal $principal -Settings $settings -Description "User context winget detection"
+        Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+        Write-Log "Task created successfully: $taskName"
+
+        $state = @{
+            TaskName       = $taskName
+            ResultFile     = $resultFile
+            TempScriptPath = $tempScriptPath
+            MarkerFile     = $markerFile
+            VbsPath        = $launch.VbsPath
+            UserInfo       = $userInfo
+            StartTime      = Get-Date
+            Started        = $false
         }
-        
-        return $apps
-        
-    } catch {
-        Write-Log "DEBUG: ERROR - Outer catch in user context detection: $($_.Exception.Message)" -IsDebug | Out-Null
-        Write-Log "DEBUG: ERROR - Outer exception type: $($_.Exception.GetType().FullName)" -IsDebug | Out-Null
-        return @()
-    } finally {
-        # Clean up old temporary script copies (older than 1 hour)
+
         try {
-            if ($userInfo) {
-                $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
-                if (Test-Path $userTempPath) {
-                    $oldTempScripts = Get-ChildItem -Path $userTempPath -Filter "availableUpgrades-detect_*.ps1" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-1) }
-                    foreach ($oldScript in $oldTempScripts) {
-                        Remove-Item $oldScript.FullName -Force -ErrorAction SilentlyContinue
-                        Write-Log "Cleaned up old temporary script: $($oldScript.Name)" | Out-Null
-                    }
-                }
-            }
+            Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+            Write-Log "Starting user detection task: $taskName"
+            $state.Started   = $true
+            $state.StartTime = Get-Date
         } catch {
-            # Ignore cleanup errors
+            Write-Log "ERROR: Failed to start scheduled task: $($_.Exception.Message)"
         }
+
+        return $state
+
+    } catch {
+        Write-Log "ERROR: Exception in Start-UserContextDetection: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Wait-UserContextDetection {
+    <#
+    .SYNOPSIS
+        v5.62: Second leg of the split. Polls for the child's result file with a timeout,
+        parses it, and returns the app records.
+    .PARAMETER State
+        The hashtable returned by Start-UserContextDetection. If $null or .Started is
+        false, returns an empty array immediately.
+    .PARAMETER TimeoutSeconds
+        Maximum time to wait, measured from the StartTime in State (so parallel SYSTEM
+        work that ran during the wait window counts against this budget). Default 180 s -
+        same value as v5.61 used inline for cold-start headroom on slow hardware.
+    .OUTPUTS
+        Array of app records on success; empty array on timeout, parse failure, or
+        missing state.
+    #>
+    param(
+        [Parameter(Mandatory)]$State,
+        [int]$TimeoutSeconds = 180
+    )
+
+    if (-not $State -or -not $State.Started) {
+        Write-Log "User context detection state invalid or task not started - returning empty result"
+        return @()
+    }
+
+    $resultFile = $State.ResultFile
+    $startTime  = $State.StartTime
+    $apps       = @()
+
+    Write-Log "Waiting for user detection results (timeout: $TimeoutSeconds seconds)"
+
+    while ((Get-Date) -lt $startTime.AddSeconds($TimeoutSeconds)) {
+        if (Test-Path $resultFile) {
+            try {
+                Start-Sleep -Milliseconds 500   # ensure child finished writing before we read
+                $fileContent = Get-Content $resultFile -Raw
+                $results = $fileContent | ConvertFrom-Json
+                # @() forces array context: PS5.1's ConvertFrom-Json unwraps single-element
+                # JSON arrays to a bare object, which then has no .Count property.
+                $apps = @($results.Apps)
+                Write-Log "User detection completed: $($apps.Count) apps found"
+                return $apps
+            } catch {
+                Write-Log "Error reading/parsing detection results: $($_.Exception.Message)"
+                Start-Sleep -Seconds 2
+                continue
+            }
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    Write-Log "User detection timed out after $TimeoutSeconds seconds - proceeding with system apps only"
+    try {
+        $task = Get-ScheduledTask -TaskName $State.TaskName -ErrorAction SilentlyContinue
+        if ($task -and $task.State -eq "Running") {
+            Stop-ScheduledTask -TaskName $State.TaskName -ErrorAction SilentlyContinue
+        }
+    } catch { }
+
+    return @()
+}
+
+function Remove-UserContextDetection {
+    <#
+    .SYNOPSIS
+        v5.62: Third leg of the split. Tears down the scheduled task and removes the
+        temp script / VBS launcher / marker / result file produced by
+        Start-UserContextDetection. Safe to call even when Start failed or State is
+        $null - all cleanup is best-effort and never throws.
+    #>
+    param(
+        [Parameter(Mandatory)]$State
+    )
+
+    if (-not $State) { return }
+
+    try {
+        if ($State.TaskName) {
+            Unregister-ScheduledTask -TaskName $State.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+
+        if ($State.ResultFile -and (Test-Path $State.ResultFile)) {
+            Remove-Item $State.ResultFile -Force -ErrorAction SilentlyContinue
+        }
+
+        if ($State.TempScriptPath -and (Test-Path $State.TempScriptPath)) {
+            Remove-Item $State.TempScriptPath -Force -ErrorAction SilentlyContinue
+            Write-Log "Removed temporary script copy: $($State.TempScriptPath)"
+        }
+
+        if ($State.VbsPath -and (Test-Path $State.VbsPath)) {
+            Remove-Item $State.VbsPath -Force -ErrorAction SilentlyContinue
+        }
+
+        if ($State.MarkerFile) {
+            $null = Remove-MarkerFile -FilePath $State.MarkerFile -Description "User detection task marker (cleanup)"
+        }
+
+        # Sweep old user-temp script copies (older than 1 hour) - mirrors the previous
+        # outer-finally cleanup in Invoke-UserContextDetection.
+        if ($State.UserInfo) {
+            try {
+                $userTempPath = "C:\Users\$($State.UserInfo.Username)\AppData\Local\Temp"
+                if (Test-Path $userTempPath) {
+                    Get-ChildItem -Path $userTempPath -Filter "availableUpgrades-detect_*.ps1" -ErrorAction SilentlyContinue |
+                        Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-1) } |
+                        ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+                }
+            } catch { }
+        }
+
+        Write-Log "User detection cleanup completed"
+    } catch {
+        Write-Log "Error during user detection cleanup: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-UserContextDetection {
+    <#
+    .SYNOPSIS
+        Backward-compat sequential wrapper: Start + Wait + Remove in one call.
+        v5.62: prefer calling Start/Wait/Remove directly so SYSTEM-side scope detection
+        can run in parallel with the child task. This wrapper exists only so existing
+        sequential call sites keep working unchanged.
+    #>
+    $state = Start-UserContextDetection
+    if (-not $state) { return @() }
+    try {
+        return Wait-UserContextDetection -State $state
+    } finally {
+        Remove-UserContextDetection -State $state
     }
 }
 
@@ -2614,20 +2523,58 @@ if ($hasSystemList -or $systemEmptyButShouldAskUser) {
                 exit 1
             }
 
-            $userApps = @()
+            # v5.62: parallelise the user-context child task with SYSTEM-side per-app scope
+            # detection. The child task takes ~35 s end-to-end; SYSTEM's scope detection on its
+            # own apps takes ~7 s. Pre-v5.62 these ran serially (~42 s); now they overlap so the
+            # total is ~35 s, shaving ~7 s off detect runtime and shrinking the IME-cleanup race
+            # window that wipes the staging directory before remediate.ps1 can launch.
+            $userDetectionState = $null
             if (Test-InteractiveSession) {
-                Write-Log -Message "Interactive session confirmed - proceeding with user context detection"
-                Write-Log -Message "DEBUG: About to call Invoke-UserContextDetection function" -IsDebug
-                # Filter the function's return stream down to actual app records: Write-Log emits the
-                # formatted line to the success stream and several cmdlets inside Invoke-UserContextDetection
-                # also output objects, so unfiltered $userApps is a mix of strings + task-info objects + apps.
-                $userApps = @((Invoke-UserContextDetection) | Where-Object {
+                Write-Log -Message "Interactive session confirmed - kicking off user context detection (async)"
+                $userDetectionState = Start-UserContextDetection
+            } else {
+                Write-Log -Message "No interactive session detected - skipping user context detection (system-only run)"
+            }
+
+            # While the child runs, pre-compute InstalledScope on the SYSTEM apps so the per-app
+            # registry walk doesn't redo it serially inside Write-UpgradeTaskFile afterwards.
+            # Write-UpgradeTaskFile (v5.62) honours an InstalledScope value already on the record.
+            if ($systemApps -and $systemApps.Count -gt 0) {
+                Write-Log -Message "Pre-computing InstalledScope for $($systemApps.Count) SYSTEM apps (parallel with user-context wait)"
+                foreach ($app in $systemApps) {
+                    $sysAppId = Get-RecordAppId -Record $app
+                    if ([string]::IsNullOrEmpty($sysAppId)) { continue }
+                    $sysFriendly = ""
+                    if ($app -is [hashtable] -or $app -is [System.Collections.IDictionary]) {
+                        if ($app.Contains('FriendlyName')) { $sysFriendly = [string]$app['FriendlyName'] }
+                    } elseif ($app.PSObject -and $app.PSObject.Properties['FriendlyName']) {
+                        $sysFriendly = [string]$app.FriendlyName
+                    }
+                    $sysScope = Get-AppInstalledScope -AppID $sysAppId -FriendlyName $sysFriendly
+                    if ($app -is [hashtable] -or $app -is [System.Collections.IDictionary]) {
+                        $app['InstalledScope'] = $sysScope
+                    } elseif ($app.PSObject) {
+                        if ($app.PSObject.Properties['InstalledScope']) {
+                            $app.InstalledScope = $sysScope
+                        } else {
+                            $app | Add-Member -MemberType NoteProperty -Name InstalledScope -Value $sysScope -Force
+                        }
+                    }
+                }
+            }
+
+            # Now block on the user-context child task. Most of its ~35 s has already overlapped
+            # with the SYSTEM scope-detection loop above, so this typically returns within a few
+            # seconds. Filter the return stream down to actual app records: although the new
+            # Wait-UserContextDetection no longer mixes log strings into its output, keeping the
+            # filter is cheap insurance against future regressions.
+            $userApps = @()
+            if ($userDetectionState) {
+                $userApps = @((Wait-UserContextDetection -State $userDetectionState) | Where-Object {
                     ($_ -is [hashtable] -or $_ -is [System.Collections.IDictionary]) -or
                     ($_.PSObject -and $_.PSObject.Properties['AppID'])
                 })
-                Write-Log -Message "DEBUG: Invoke-UserContextDetection returned $($userApps.Count) apps after filtering" -IsDebug
-            } else {
-                Write-Log -Message "No interactive session detected - skipping user context detection (system-only run)"
+                Write-Log -Message "Wait-UserContextDetection returned $($userApps.Count) apps after filtering"
             }
 
             # Merge by AppID. SYSTEM record wins on conflict because its InstalledScope was
@@ -2652,6 +2599,13 @@ if ($hasSystemList -or $systemEmptyButShouldAskUser) {
                 }
             }
             Write-Log -Message "Merged detection: $($systemApps.Count) system + $($userApps.Count) user = $($mergedApps.Count) unique apps"
+
+            # v5.62: now that we've consumed the child task's result, clean up the temp artifacts
+            # it left behind (scheduled task, result file, temp script copy, VBS launcher, marker).
+            # Safe no-op if $userDetectionState is $null (no interactive session, or Start- failed).
+            if ($userDetectionState) {
+                Remove-UserContextDetection -State $userDetectionState
+            }
 
             if ($mergedApps.Count -gt 0) {
                 # Write the task file BEFORE the [ScriptTag] summary so the summary line is the
