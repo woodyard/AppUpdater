@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.64
- Tag: 64
+ Version: 9.65
+ Tag: 65
     
     Version History:
     1.0 - Initial version
@@ -129,6 +129,7 @@
     9.62 - FIX: Close-app prompt for non-deferral apps was invisible behind the persistent dialog host. Reported by the user via the 13-05-26 log: Notepad++'s close-app prompt (deferral-enabled, routed through the host) worked correctly, but 7-Zip's close-app prompt (deferral-disabled, fell to Invoke-SystemUserPrompt's legacy WPF spawn via wscript+VBS) silently timed out after 120 s on three consecutive runs (v9.59/v9.60/v9.61). Root cause: between apps the host shows a "Notepad++ updated -> Starting 7-Zip" transition panel at the bottom-right corner; the legacy spawn's WPF window targets the SAME bottom-right corner and is also Topmost. Z-order between two cross-process Topmost windows is undefined and Windows' foreground-stealing protections prevented the newer legacy dialog from coming to front, so it stayed hidden behind the host's transition panel for the full 120 s. Show-ProcessCloseDialog's no-deferral branch now routes through the persistent dialog host's prompt-deferral panel when Test-DialogHostAlive: payload uses canDefer=true (both Defer and Update Now active), daysLeft=null (counter suppressed since these apps have no day-based deferral). Update Now -> close+update, Defer -> keep app open, timeout -> falls back to $DefaultTimeoutAction. Legacy WPF spawn remains as the fallback when the host is not alive (e.g. host startup failed) or doesn't reply. Also adds the v9.60 "save your work first" warning to the legacy WPF body so both paths show the same advice.
     9.63 - REFACTOR (part 1 of 2): Persistent dialog host is now mandatory - legacy per-task WPF spawn fallback has been removed from every wrapper. Background: per the user "seems off that a switch to legacy is needed. Shouldn't we just fix the issue?" - the legacy fallback was a parallel codebase nobody exercised, so host bugs either went unnoticed (silent fallback masked them) or got "fixed" by re-routing through legacy instead of hardening the host. Each wrapper now returns a safe default when Test-DialogHostAlive is false: Show-CompletionNotification logs and skips; Show-UpgradeProgressNotification returns $null; Write-InfoDialogStatus no-ops; Show-MandatoryUpdateDialog returns "Continue" (mandatory always proceeds); Show-DeferralDialog returns Action=Update with CloseProcess=$hasBlockingProcess (leaving the app skipped indefinitely would just stack tasks); Show-VersionSkipDialog returns $false (retry next cycle); Show-ProcessCloseDialog returns CloseProcess=$DefaultTimeoutAction. The orphaned legacy helper functions (Invoke-SystemUserPrompt, Invoke-SystemCompletionNotification, Invoke-SystemDeferralPrompt, Show-DirectUserDialog, Show-DirectCompletionNotification, Show-DirectDeferralDialog, Show-DirectMandatoryUpdateDialog, Show-UserDialog, Show-ModernDialog, Show-EnhancedDeferralDialog) and their embedded WPF here-strings are unreachable from the main remediation flow now but are left in place to keep this commit focused on the behavioural change; v9.64 deletes them as a pure dead-code cleanup. Diff: removed ~400 lines of legacy fallback bodies from the seven wrappers, parser-check still passes.
     9.64 - REFACTOR (part 2 of 2): Pure dead-code cleanup. Deleted the 12 orphaned legacy helper functions and their embedded WPF here-strings that became unreachable in v9.63 - New-UserPromptTask, Start-UserPromptTask, Wait-ForUserResponse, Remove-UserPromptTask, Invoke-SystemUserPrompt (and its inline Write-UserLog/Write-ResponseFile/Show-ModernDialog), Show-DirectUserDialog, Show-DirectCompletionNotification, Invoke-SystemCompletionNotification, Show-DirectMandatoryUpdateDialog, Invoke-SystemMandatoryUpdatePrompt, Show-UserDialog, Show-EnhancedDeferralDialog, Show-DirectDeferralDialog, Invoke-SystemDeferralPrompt. Also removed the C:\Temp\wpf-test-trigger.txt diagnostic test path that exercised Invoke-SystemUserPrompt. Remove-StaleScheduledTasks's prefix list keeps the legacy entries (UserPrompt_, UpgradeProgress_, CompletionNotification_, MandatoryPrompt_, DeferralPrompt_, SkipPrompt_) so machines upgrading from pre-v9.64 still sweep any stale tasks created by the old code. Remove-OldTempFiles regex left as-is for the same reason. Diff: 3004 lines deleted, file went from 8683 to 5679 lines (35% smaller). Parser-check passes.
+    9.65 - FIX: Manual admin-user run silently force-closed the blocking process instead of prompting. Reported in field 2026-05-18: running the script from an elevated Windows Terminal session committed suicide a few seconds in - the only user-scoped task was Microsoft.WindowsTerminal, Show-DeferralDialog logged "dialog host not alive - defaulting to Update", and Stop-Process killed the very Terminal hosting the running PowerShell. Root cause: Start-DialogHost was gated on Test-RunningAsSystem only (a SYSTEM-only path for Intune runs), so manual user-admin invocations never started the host. Combined with v9.63's removal of the legacy per-dialog fallback, Show-DeferralDialog's no-host branch returned Action=Update straight away. New $Script:OwnsDialogHost flag is set true when (a) not a -UserRemediationOnly handoff, (b) not connecting to an existing session via -DialogSessionId, and (c) running as SYSTEM OR as an interactive admin (with a desktop session). The three Start-DialogHost / Stop-DialogHost call sites now share this flag so the start and stop guards stay in sync, and an admin running the script by hand gets the same prompt experience SYSTEM gets via Intune.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -3923,6 +3924,15 @@ Write-Log -Message ('=' * 78)
 Write-Log -Message "===== RemediateAvailableUpgrades v$scriptVersion  PID $PID  $ctxLabel context  on $env:COMPUTERNAME"
 Write-Log -Message ('=' * 78)
 
+# v9.65: who is allowed to own (start AND stop) the persistent dialog host this run.
+# SYSTEM owns it for normal Intune-launched runs; an interactive admin owns it when
+# the script is invoked by hand (so manual runs get the same Defer/Update prompt
+# instead of v9.63's no-host-default which would force-close the blocking process -
+# fatal when the blocking process is the terminal hosting the running script).
+# -UserRemediationOnly is excluded (that handoff path connects to SYSTEM's existing
+# session) and so is any run that already has a -DialogSessionId to attach to.
+$Script:OwnsDialogHost = (-not $UserRemediationOnly) -and (-not $DialogSessionId) -and ($isSystemContext -or ($userIsAdmin -and $isInteractive))
+
 <# ----------------------------------------------- #>
 
 # v9.46: Pin the system awake for the whole remediation run. SetThreadExecutionState is
@@ -4873,11 +4883,11 @@ if ($LIST -and $LIST.Count -gt 0) {
             Write-Log -Message "Winget source pre-update failed (non-fatal): $($_.Exception.Message)"
         }
 
-        # Start the persistent dialog host (v9.33). Only SYSTEM context owns the host;
-        # user-context attaches via Connect-DialogSession when it gets -DialogSessionId.
-        # Failure here populates $Script:DialogLegacyFallback so all dialog wrappers
-        # transparently fall back to the legacy per-dialog spawn path.
-        if ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
+        # Start the persistent dialog host (v9.33). v9.65 widened ownership from
+        # SYSTEM-only to any context with $Script:OwnsDialogHost set (SYSTEM or an
+        # interactive admin doing a manual run); the -UserRemediationOnly handoff
+        # still attaches to SYSTEM's session via Connect-DialogSession.
+        if ($Script:OwnsDialogHost) {
             Write-Log -Message "Starting persistent dialog host"
             Start-DialogHost | Out-Null
         }
@@ -5618,10 +5628,11 @@ if ($LIST -and $LIST.Count -gt 0) {
             Write-Log -Message "*** USER CONTEXT TASK EXITING after $($totalUserContextTime.TotalSeconds) seconds ***"
         }
         
-        # Stop the persistent dialog host (v9.33). SYSTEM owns lifecycle; user-context
-        # is a no-op because Stop-DialogHost short-circuits on $Script:DialogSession=null,
-        # and even if user-context attached, only SYSTEM writes the TaskName/PID.
-        if ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
+        # Stop the persistent dialog host (v9.33). Whoever started it stops it -
+        # see $Script:OwnsDialogHost (v9.65). User-context handoffs are a no-op
+        # because Stop-DialogHost short-circuits on $Script:DialogSession=null,
+        # and only the owning context writes the TaskName/PID.
+        if ($Script:OwnsDialogHost) {
             Stop-DialogHost | Out-Null
         }
 
@@ -5675,8 +5686,8 @@ if ($LIST -and $LIST.Count -gt 0) {
         }
     }
 
-    # Stop the persistent dialog host on the no-upgrades path too (v9.33).
-    if ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
+    # Stop the persistent dialog host on the no-upgrades path too (v9.33 / v9.65).
+    if ($Script:OwnsDialogHost) {
         Stop-DialogHost | Out-Null
     }
 
