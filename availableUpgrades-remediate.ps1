@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.65
- Tag: 65
+ Version: 9.66
+ Tag: 66
     
     Version History:
     1.0 - Initial version
@@ -130,6 +130,7 @@
     9.63 - REFACTOR (part 1 of 2): Persistent dialog host is now mandatory - legacy per-task WPF spawn fallback has been removed from every wrapper. Background: per the user "seems off that a switch to legacy is needed. Shouldn't we just fix the issue?" - the legacy fallback was a parallel codebase nobody exercised, so host bugs either went unnoticed (silent fallback masked them) or got "fixed" by re-routing through legacy instead of hardening the host. Each wrapper now returns a safe default when Test-DialogHostAlive is false: Show-CompletionNotification logs and skips; Show-UpgradeProgressNotification returns $null; Write-InfoDialogStatus no-ops; Show-MandatoryUpdateDialog returns "Continue" (mandatory always proceeds); Show-DeferralDialog returns Action=Update with CloseProcess=$hasBlockingProcess (leaving the app skipped indefinitely would just stack tasks); Show-VersionSkipDialog returns $false (retry next cycle); Show-ProcessCloseDialog returns CloseProcess=$DefaultTimeoutAction. The orphaned legacy helper functions (Invoke-SystemUserPrompt, Invoke-SystemCompletionNotification, Invoke-SystemDeferralPrompt, Show-DirectUserDialog, Show-DirectCompletionNotification, Show-DirectDeferralDialog, Show-DirectMandatoryUpdateDialog, Show-UserDialog, Show-ModernDialog, Show-EnhancedDeferralDialog) and their embedded WPF here-strings are unreachable from the main remediation flow now but are left in place to keep this commit focused on the behavioural change; v9.64 deletes them as a pure dead-code cleanup. Diff: removed ~400 lines of legacy fallback bodies from the seven wrappers, parser-check still passes.
     9.64 - REFACTOR (part 2 of 2): Pure dead-code cleanup. Deleted the 12 orphaned legacy helper functions and their embedded WPF here-strings that became unreachable in v9.63 - New-UserPromptTask, Start-UserPromptTask, Wait-ForUserResponse, Remove-UserPromptTask, Invoke-SystemUserPrompt (and its inline Write-UserLog/Write-ResponseFile/Show-ModernDialog), Show-DirectUserDialog, Show-DirectCompletionNotification, Invoke-SystemCompletionNotification, Show-DirectMandatoryUpdateDialog, Invoke-SystemMandatoryUpdatePrompt, Show-UserDialog, Show-EnhancedDeferralDialog, Show-DirectDeferralDialog, Invoke-SystemDeferralPrompt. Also removed the C:\Temp\wpf-test-trigger.txt diagnostic test path that exercised Invoke-SystemUserPrompt. Remove-StaleScheduledTasks's prefix list keeps the legacy entries (UserPrompt_, UpgradeProgress_, CompletionNotification_, MandatoryPrompt_, DeferralPrompt_, SkipPrompt_) so machines upgrading from pre-v9.64 still sweep any stale tasks created by the old code. Remove-OldTempFiles regex left as-is for the same reason. Diff: 3004 lines deleted, file went from 8683 to 5679 lines (35% smaller). Parser-check passes.
     9.65 - FIX: Manual admin-user run silently force-closed the blocking process instead of prompting. Reported in field 2026-05-18: running the script from an elevated Windows Terminal session committed suicide a few seconds in - the only user-scoped task was Microsoft.WindowsTerminal, Show-DeferralDialog logged "dialog host not alive - defaulting to Update", and Stop-Process killed the very Terminal hosting the running PowerShell. Root cause: Start-DialogHost was gated on Test-RunningAsSystem only (a SYSTEM-only path for Intune runs), so manual user-admin invocations never started the host. Combined with v9.63's removal of the legacy per-dialog fallback, Show-DeferralDialog's no-host branch returned Action=Update straight away. New $Script:OwnsDialogHost flag is set true when (a) not a -UserRemediationOnly handoff, (b) not connecting to an existing session via -DialogSessionId, and (c) running as SYSTEM OR as an interactive admin (with a desktop session). The three Start-DialogHost / Stop-DialogHost call sites now share this flag so the start and stop guards stay in sync, and an admin running the script by hand gets the same prompt experience SYSTEM gets via Intune.
+    9.66 - FIX: Manual admin runs were dropping every machine-scoped task on the floor. Reported in field 2026-05-18: a task file with 6 machine-scoped entries (Google.Chrome, Microsoft.VCRedist.2015+.x86, Microsoft.DotNet.SDK.8, Microsoft.VCRedist.2015+.x64, Microsoft.DotNet.DesktopRuntime.8, Microsoft.DotNet.DesktopRuntime.9) produced "0 routed to user context, 6 left for the other context" and the run exited with no work done. Root cause: scope routing assumed the user context only ever runs as an Intune-spawned handoff after SYSTEM has already processed machine-scoped entries, so the allowed-scopes list for user context was @("user", "unknown"). Manual admin runs aren't preceded by a SYSTEM pass - there's no "other context" to defer machine work to - but the admin token can drive machine-wide winget upgrades just fine on its own. New $isManualAdmin flag (not SYSTEM, not -UserRemediationOnly, $userIsAdmin) widens the allowed scopes to @("machine", "user", "unknown") for that path so a hand-launched admin run actually processes the full task file. Also: replaced the stale "No upgrades found in winget output" log line at the empty-list exit with "No work for this context (task file routed all entries to another context, or task file empty)" - the winget-discovery code path was removed in v9.21 but the misleading message survived. And $contextLabel now reads "user (admin manual)" for the new branch to distinguish it from Intune user-context handoffs in the log.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -4815,8 +4816,15 @@ $rawTaskList = @(Read-UpgradeTaskFile)
 if ($rawTaskList -and $rawTaskList.Count -gt 0) {
     # Filter the task list down to entries that belong in the current context:
     #   - SYSTEM: machine-scoped only (v9.55 dropped "unknown" from SYSTEM's allowed list)
-    #   - User context: user-scoped + unknown (admin user-context can elevate via RunLevel
-    #     Highest, see v9.54, so it covers the unknown-might-be-machine case too)
+    #   - User context (Intune handoff): user-scoped + unknown (admin user-context can
+    #     elevate via RunLevel Highest, see v9.54, so it covers the unknown-might-be-machine
+    #     case too)
+    #   - v9.66: Manual admin run: ALL scopes. There's no preceding SYSTEM pass to take
+    #     care of machine-scoped entries, so the admin has to cover them too. The admin
+    #     token can drive machine-wide winget upgrades directly. Without this widening, a
+    #     manual run on a task file that only contained machine apps would filter them all
+    #     out and log "0 routed to user context, N left for the other context" - nothing
+    #     happens despite the user being fully privileged.
     # v9.55 rationale: with detect.ps1 v5.60's SYSTEM-side visibility probe, anything reaching
     # remediate as "unknown" has already been proven invisible-to-SYSTEM during detection.
     # Letting SYSTEM try it anyway wastes the attempt AND - worse - bumps the per-version
@@ -4825,7 +4833,14 @@ if ($rawTaskList -and $rawTaskList.Count -gt 0) {
     # turn (observed in the 18:44 log for Git.Git). Now unknown-scope tasks bypass SYSTEM
     # entirely and go straight to user-context.
     $isSystem = (Test-RunningAsSystem)
-    $allowedScopes = if ($isSystem) { @("machine") } else { @("user", "unknown") }
+    $isManualAdmin = (-not $isSystem) -and (-not $UserRemediationOnly) -and $userIsAdmin
+    if ($isSystem) {
+        $allowedScopes = @("machine")
+    } elseif ($isManualAdmin) {
+        $allowedScopes = @("machine", "user", "unknown")
+    } else {
+        $allowedScopes = @("user", "unknown")
+    }
     $filtered = [System.Collections.ArrayList]::new()
     $skippedIds = [System.Collections.ArrayList]::new()
     foreach ($t in $rawTaskList) {
@@ -4839,7 +4854,7 @@ if ($rawTaskList -and $rawTaskList.Count -gt 0) {
     $LIST = $filtered
     $Script:TasksForOtherContext = $skippedIds.Count
     $Script:OtherContextAppIds = @($skippedIds)
-    $contextLabel = if ($isSystem) { "SYSTEM" } else { "user" }
+    $contextLabel = if ($isSystem) { "SYSTEM" } elseif ($isManualAdmin) { "user (admin manual)" } else { "user" }
     $listCount = $LIST.Count
     Write-Log -Message "Task file: $($rawTaskList.Count) entries, $listCount routed to $contextLabel context, $($skippedIds.Count) left for the other context"
     if ($listCount -gt 0) {
@@ -5640,7 +5655,10 @@ if ($LIST -and $LIST.Count -gt 0) {
         Invoke-MarkerFileCleanup -Reason "Script completion (remediation complete)"
         exit 0
 } else {
-    Write-Log -Message "[$ScriptTag] No upgrades found in winget output"
+    # v9.66: log line corrected. Since v9.21 we don't query winget for discovery -
+    # the task file is the sole source of work - so "No upgrades found in winget output"
+    # was a stale message that misled anyone reading the log of an empty-list run.
+    Write-Log -Message "[$ScriptTag] No work for this context (task file routed all entries to another context, or task file empty)"
 
     # SYSTEM had no machine-scoped work itself, but the task file may still contain user-scoped
     # entries that need handing off. Without this branch, an all-user-scope task file would
