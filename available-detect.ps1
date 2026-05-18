@@ -141,6 +141,16 @@ try {
         exit 0
     }
 
+    # Step 1b: skip this cycle if the maintainer is currently mid-run. Reading the
+    # task file while the maintainer is writing it could yield partial JSON, and if
+    # we triggered remediate now both would race for task-file mutations through the
+    # rest of the cycle. Cheaper to skip and let the next Intune sync (or the next
+    # maintainer hourly tick) re-evaluate against a settled task file.
+    if ($existing.State -eq 'Running') {
+        Write-Output "[AppUpdater] Maintainer task is currently running - skipping this cycle (will retry next sync)"
+        exit 0
+    }
+
     # Step 2: read the task file. Treat missing / stale / empty / unparseable as compliant.
     if (-not (Test-Path $taskFile)) {
         Write-Output "[AppUpdater] No task file present yet (maintainer may still be running its first cycle)"
