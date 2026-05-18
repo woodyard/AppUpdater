@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.62
-    Tag: 92
+    Version: 5.63
+    Tag: 93
     
     Version History:
     1.0 - Initial version
@@ -109,6 +109,7 @@
     5.60 - FIX: Get-AppInstalledScope now adds a SYSTEM-side visibility probe AFTER it resolves to "machine". An app can be correctly machine-scoped (Program Files install, real HKLM Uninstall entry) yet still un-upgradeable from SYSTEM context, because winget's catalog-Id <-> installed-binary binding lives in per-user LocalState (%LOCALAPPDATA%\Packages\Microsoft.DesktopAppInstaller_*). SYSTEM's LocalState is empty for apps the user installed via `winget install`, so `winget list --id X --exact` from SYSTEM returns nothing even when the app is genuinely installed (Git.Git is the canonical case - confirmed by PsExec -s test). Probe: when SYSTEM detects "machine", run `winget list --id X --exact --source winget` from SYSTEM. If the output doesn't contain the AppID, downgrade to "unknown" - that routes through remediate.ps1 v9.49's user-context retry handoff, where the user's own winget LocalState has the binding. Decision-by tag in the log now appends "+invisible-to-system" so the probe firing is traceable. Cost: one extra ~1-2s winget call per machine-detected app, only paid in SYSTEM-context detection. Pairs with remediate.ps1 v9.54.
     5.61 - TUNE: User-context detection timeout bumped from 90 s to 180 s. Field report 2026-05-18: H-SURFACELAP5's first detect run timed out at 90 s waiting for the user-context scheduled task result, the second run (~7 min later, task warm) completed in ~70 s. The 90 s timeout pushed total detect runtime past 3 minutes, which collided with IME's housekeeping of C:\WINDOWS\IMECache\HealthScripts\<guid>_<rev>\ - by the time agentexecutor.exe called DumpResultsToFile to persist the script's exit-1, the directory was gone (DirectoryNotFoundException). agentexecutor.exe swallowed that exception and exited 0, so Intune read "compliant" and never queued remediation despite 7 apps being in the task file. 180 s leaves room for cold starts (task registration + wscript+VBS launcher + PowerShell warmup + whitelist download + winget enumeration) while keeping detect well inside whatever cleanup window IME uses. Subsequent warm runs are unchanged.
     5.62 - PERF: Parallelised SYSTEM-side work with the user-context child task to shave ~7-15 s off detect runtime and shrink the IME-cleanup race window. Field repro 2026-05-18: a 65 s detect run was racing IME's cleanup of C:\WINDOWS\IMECache\HealthScripts\<guid>_<rev>\ - by the time agentexecutor wrote the detect result and IME's ScriptProcessor went to launch remediate.ps1, IME's own housekeeping had wiped the staging directory, ResultManager.CreateResultFiles threw DirectoryNotFoundException, and remediation was never launched. Split Invoke-UserContextDetection into Start-UserContextDetection (registers and starts the task, returns a state object immediately), Wait-UserContextDetection (polls for the child's result file with timeout), and Remove-UserContextDetection (cleans up task + temp files). SYSTEM main path now kicks off the child task right after $systemApps is built and PRE-COMPUTES per-app InstalledScope on SYSTEM's records during the wait window, instead of doing the scope detection serially inside Write-UpgradeTaskFile after the child finishes. Write-UpgradeTaskFile honours an InstalledScope value pre-set on the input record so it doesn't redo the work. Net: the ~7 s SYSTEM scope-detect overlaps with the ~35 s child task instead of running after it. Backward compat: Invoke-UserContextDetection is kept as a thin Start/Wait/Remove wrapper for any path that still calls it sequentially.
+    5.63 - FIX: Fallback whitelist URL pointed at the old woodyard/public-scripts/main/remediations repo, not woodyard/AppUpdater/main. When the new maintainer-launcher-style invocation (no $global:whitelistUrl prelude) didn't pre-set the URL, detect fetched 18904 bytes from the wrong repo and got the OLD whitelist where Anthropic.Claude was still enabled, so Claude landed in availableUpgrades-tasks.json. Remediate then loaded the correct AppUpdater whitelist where Claude is Disabled, the per-app loop's whitelist match silently dropped it, and the user-context remediation logged "0 apps processed" with no Claude dialog. Same fix in availableUpgrades-remediate.ps1 v9.68.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -1607,7 +1608,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "77" # Update this tag for each script version
+$ScriptTag = "93" # Keep in sync with the Tag field in the header .NOTES block
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy # EU format; per-day rollover so all runs in one day share a log file
 $LogFullName = "$LogName-$LogDate.log"
@@ -1926,7 +1927,12 @@ if ($localWhitelistPath -and (Test-Path $localWhitelistPath)) {
 # cached body). Significantly reduces external dependency on every Intune cycle.
 if ([string]::IsNullOrEmpty($whitelistJSON)) {
     if (-not $whitelistUrl) {
-        $whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"
+        # v5.63: was woodyard/public-scripts/main/remediations - that whitelist has Anthropic.Claude
+        # still enabled, while AppUpdater has it Disabled. When a caller invokes the script without
+        # setting $global:whitelistUrl first (e.g. the maintainer-launcher), this default kicks in
+        # and we'd ship the wrong whitelist - resulting in Claude being detected here but then
+        # silently dropped by remediate (which loads the correct AppUpdater whitelist).
+        $whitelistUrl = "https://raw.githubusercontent.com/woodyard/AppUpdater/main/app-whitelist.json"
     }
     $whitelistJSON = Get-CachedWhitelistJSON -Url $whitelistUrl
 }
