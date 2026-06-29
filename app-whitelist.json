@@ -258,7 +258,7 @@
             "FriendlyName": "Azure Storage Explorer",
             "Category": "Development",
             "BlockingProcess": "StorageExplorer",
-            "Disabled": true
+            "Disabled": false
         },
         {
             "AppID": "Amazon.AWSCLI",
@@ -466,7 +466,6 @@
             "FriendlyName": "Ghostscript",
             "Category": "Media"
         },
-
         {
             "AppID": "7zip.7zip",
             "FriendlyName": "7-Zip",

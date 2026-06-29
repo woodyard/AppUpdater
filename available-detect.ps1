@@ -20,11 +20,6 @@
 #   0 = compliant / nothing to do
 #   1 = non-compliant / run remediation script
 #
-# Why this works: the heavy detection (winget upgrade, user-context handoff,
-# per-app scope walk - 30-60 s of work) runs from a Task Scheduler trigger
-# on the device, NOT inside the Intune Remediation timeout window. IME's
-# detect launch budget is irrelevant to that task. This script only ever
-# does a file read + small JSON parse.
 
 $ErrorActionPreference = 'Stop'
 
