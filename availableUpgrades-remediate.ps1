@@ -19,7 +19,7 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.68
+ Version: 9.69
  Tag: 68
     
     Version History:
@@ -133,6 +133,7 @@
     9.66 - FIX: Manual admin runs were dropping every machine-scoped task on the floor. Reported in field 2026-05-18: a task file with 6 machine-scoped entries (Google.Chrome, Microsoft.VCRedist.2015+.x86, Microsoft.DotNet.SDK.8, Microsoft.VCRedist.2015+.x64, Microsoft.DotNet.DesktopRuntime.8, Microsoft.DotNet.DesktopRuntime.9) produced "0 routed to user context, 6 left for the other context" and the run exited with no work done. Root cause: scope routing assumed the user context only ever runs as an Intune-spawned handoff after SYSTEM has already processed machine-scoped entries, so the allowed-scopes list for user context was @("user", "unknown"). Manual admin runs aren't preceded by a SYSTEM pass - there's no "other context" to defer machine work to - but the admin token can drive machine-wide winget upgrades just fine on its own. New $isManualAdmin flag (not SYSTEM, not -UserRemediationOnly, $userIsAdmin) widens the allowed scopes to @("machine", "user", "unknown") for that path so a hand-launched admin run actually processes the full task file. Also: replaced the stale "No upgrades found in winget output" log line at the empty-list exit with "No work for this context (task file routed all entries to another context, or task file empty)" - the winget-discovery code path was removed in v9.21 but the misleading message survived. And $contextLabel now reads "user (admin manual)" for the new branch to distinguish it from Intune user-context handoffs in the log.
     9.67 - FIX: Azure AD UPN lookup always returned "N/A" under Intune Remediations. Field repro 2026-05-18: log shows "Azure AD identity cache path does not exist (user may be local account)" even though the device is Azure AD-joined and HKLM:\SOFTWARE\Microsoft\IdentityStore\Cache\<SID>\IdentityCache\<SID> exists with UserName=henrik@cloudonly.dk. Same WoW64 trap remediate v9.42 / detect v5.51 fixed for HKLM:\SOFTWARE\AppUpdater - Intune Remediations default to a 32-bit PowerShell host (C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe) and PSDrive registry access (Test-Path HKLM:\SOFTWARE\X, Get-ItemProperty HKLM:\SOFTWARE\X) silently passes through the WoW64 redirector, rewriting HKLM:\SOFTWARE\Microsoft\IdentityStore to HKLM:\SOFTWARE\WOW6432Node\Microsoft\IdentityStore. IdentityStore is a 64-bit-only key with no WOW6432Node mirror, so Test-Path returns False and the lookup never runs. Replaced the PSDrive Test-Path + Get-ItemProperty pair with [Microsoft.Win32.RegistryKey]::OpenBaseKey(LocalMachine, Registry64).OpenSubKey(...).GetValue('UserName'), same pattern as the AppRegBase helpers - bypasses the redirector and reads the natural 64-bit view regardless of host bitness. UPN now resolves correctly, so anything downstream that branches on $userInfo.AzureADUser actually gets the value. detect.ps1 doesn't have this code path so no detect change needed.
     9.68 - FIX: Fallback whitelist URL pointed at woodyard/public-scripts/main/remediations - that copy is stale relative to AppUpdater's. Updated to https://raw.githubusercontent.com/woodyard/AppUpdater/main/app-whitelist.json so any code path that lands on the default (caller didn't pass -WhitelistUrl, no marker file restore) loads the same whitelist the rest of the system uses. Pairs with detect.ps1 v5.63 - they had identical drift. Without this, detect using one whitelist and remediate using the other meant disabled-in-AppUpdater apps (e.g. Anthropic.Claude) showed up in the task file but were silently filtered by remediate's loop, so user-context remediation logged "0 apps processed" with no Claude dialog despite Claude being in the task file.
+    9.69 - FIX: Unified dialog never appeared for all-user-scope task files (the common Intune case). Start-DialogHost was called only inside the `if ($LIST -and $LIST.Count -gt 0)` work branch, so when SYSTEM's filtered work list was empty (every task routed to user context) it took the else branch, scheduled the user-context handoff, but never started the dialog host. The handoff arg-builder only appends -DialogSessionId when Test-DialogHostAlive, so user-context received no session id; and being a -UserRemediationOnly handoff it is barred by $Script:OwnsDialogHost from owning a host itself. Result: every Show-* wrapper hit "host not alive" and returned its v9.63 safe default - no dialog rendered in EITHER context, even though detect had queued user-scoped upgrades. Mixed task files worked only because SYSTEM's own machine-scoped pass happened to start the host. Fix: hoisted the host startup ahead of the work-branch and widened its guard to $Script:OwnsDialogHost -and (local work OR $Script:TasksForOtherContext -gt 0), so SYSTEM brings the host up whenever there is work in either context. Teardown (Stop-DialogHost) on both exit paths is already gated on the same $Script:OwnsDialogHost flag, so it stays symmetric. Compounds with v9.68: that fixed whitelist drift as one cause of empty user-context dialogs; this fixes a second, independent cause.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -4893,6 +4894,21 @@ if ($Script:TestMode -and $Script:TestModeInjected) {
     Write-Log -Message "TEST MODE: appended simulated task; total work list = $($LIST.Count)"
 }
 
+# Start the persistent dialog host (v9.33) BEFORE branching on whether THIS context has
+# local work. v9.69: the host must come up even when $LIST is empty but the task file
+# routed entries to the user context - SYSTEM still hands those off via
+# Schedule-UserContextRemediation, which only appends -DialogSessionId when the host is
+# already alive. Without this, an all-user-scope task file (the common Intune case) started
+# no host in SYSTEM, passed no session id to user-context, and user-context - being a
+# -UserRemediationOnly handoff - is barred by $Script:OwnsDialogHost from owning a host
+# itself, so every dialog wrapper hit "host not alive" and nothing rendered in either
+# context. v9.65: ownership is SYSTEM or an interactive admin; the -UserRemediationOnly
+# handoff attaches to SYSTEM's session via Connect-DialogSession instead.
+if ($Script:OwnsDialogHost -and (($LIST -and $LIST.Count -gt 0) -or ($Script:TasksForOtherContext -gt 0))) {
+    Write-Log -Message "Starting persistent dialog host"
+    Start-DialogHost | Out-Null
+}
+
 if ($LIST -and $LIST.Count -gt 0) {
         $count = 0
         $message = ""
@@ -4912,15 +4928,6 @@ if ($LIST -and $LIST.Count -gt 0) {
             Write-Log -Message "Winget source pre-update complete"
         } catch {
             Write-Log -Message "Winget source pre-update failed (non-fatal): $($_.Exception.Message)"
-        }
-
-        # Start the persistent dialog host (v9.33). v9.65 widened ownership from
-        # SYSTEM-only to any context with $Script:OwnsDialogHost set (SYSTEM or an
-        # interactive admin doing a manual run); the -UserRemediationOnly handoff
-        # still attaches to SYSTEM's session via Connect-DialogSession.
-        if ($Script:OwnsDialogHost) {
-            Write-Log -Message "Starting persistent dialog host"
-            Start-DialogHost | Out-Null
         }
 
         Write-Log -Message "Starting app processing loop..."
